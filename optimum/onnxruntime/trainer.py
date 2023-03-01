@@ -24,14 +24,15 @@ import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
-from tqdm.auto import tqdm
-
 
 # Integrations must be imported before ML frameworks:
-from transformers.integrations import (  # isort: split
+# isort: off
+from transformers.integrations import (
     hp_params,
     is_fairscale_available,
 )
+
+# isort: on
 
 import numpy as np
 import torch
@@ -39,14 +40,12 @@ import torch.distributed as dist
 from torch import nn
 from torch.utils.data import DataLoader, Dataset, RandomSampler
 from torch.utils.data.distributed import DistributedSampler
-from transformers import PreTrainedModel, __version__
+from tqdm.auto import tqdm
 from transformers.data.data_collator import DataCollator
 from transformers.debug_utils import DebugOption, DebugUnderflowOverflow
 from transformers.deepspeed import deepspeed_init, is_deepspeed_zero3_enabled
 from transformers.dependency_versions_check import dep_version_check
 from transformers.file_utils import (
-    CONFIG_NAME,
-    WEIGHTS_NAME,
     is_apex_available,
     is_sagemaker_dp_enabled,
     is_sagemaker_mp_enabled,
@@ -88,13 +87,14 @@ from transformers.trainer_utils import (
 from transformers.utils import logging
 
 from ..exporters import TasksManager
-from ..exporters.onnx import OnnxConfigWithPast, export
+from ..exporters.onnx import OnnxConfigWithPast, export, export_models, get_decoder_models_for_export
 from .modeling_decoder import ORTModelForCausalLM
 from .modeling_ort import (
     ORTModel,
     ORTModelForCustomTasks,
     ORTModelForFeatureExtraction,
     ORTModelForImageClassification,
+    ORTModelForMaskedLM,
     ORTModelForMultipleChoice,
     ORTModelForQuestionAnswering,
     ORTModelForSemanticSegmentation,
@@ -117,7 +117,6 @@ if is_apex_available():
 
 if is_fairscale_available():
     dep_version_check("fairscale")
-    import fairscale
     from fairscale.nn.data_parallel import ShardedDataParallel as ShardedDDP
     from fairscale.optim import OSS
 
@@ -138,7 +137,7 @@ SCALER_NAME = "scaler.pt"
 class ORTFeaturesManager:
     _TASKS_TO_ORTMODELS = {
         "default": ORTModelForFeatureExtraction,
-        "masked-lm": ORTModelForFeatureExtraction,
+        "masked-lm": ORTModelForMaskedLM,
         "causal-lm": ORTModelForCausalLM,
         "causal-lm-with-past": ORTModelForCausalLM,
         "seq2seq-lm": ORTModelForSeq2SeqLM,
@@ -161,6 +160,16 @@ class ORTFeaturesManager:
         """
 
         return ORTFeaturesManager._TASKS_TO_ORTMODELS[feature]
+
+    @staticmethod
+    def do_use_cache(feature: str) -> bool:
+        """
+        Gets the value of `use_cache` for the feature.
+        """
+        if "-with-past" in feature:
+            return True
+        else:
+            return False
 
 
 class ORTTrainer(Trainer):
@@ -256,7 +265,6 @@ class ORTTrainer(Trainer):
         preprocess_logits_for_metrics: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
         onnx_model_path: Union[str, os.PathLike] = None,
     ):
-
         super().__init__(
             model=model,
             args=args,
@@ -404,7 +412,6 @@ class ORTTrainer(Trainer):
                 num_train_epochs = math.ceil(args.num_train_epochs)
                 num_train_samples = self.num_examples(train_dataloader) * args.num_train_epochs
         elif args.max_steps > 0:  # Rely on max_steps when dataloader does not have a working size
-
             max_steps = args.max_steps
             # Setting a very large number of epochs so we go as many times as necessary over the iterator.
             num_train_epochs = sys.maxsize
@@ -608,7 +615,6 @@ class ORTTrainer(Trainer):
 
             step = -1
             for step, inputs in enumerate(train_dataloader):
-
                 # Skip past any already trained steps if resuming training
                 if steps_trained_in_current_epoch > 0:
                     steps_trained_in_current_epoch -= 1
@@ -940,7 +946,6 @@ class ORTTrainer(Trainer):
         ignore_keys: Optional[List[str]] = None,
         metric_key_prefix: str = "eval",
     ) -> EvalLoopOutput:
-
         """
         Prediction/evaluation loop, shared by `ORTTrainer.evaluate()` and `ORTTrainer.predict()`.
 
@@ -951,6 +956,7 @@ class ORTTrainer(Trainer):
         # Check if there are labels in the dataset
         dummy_inputs = next(iter(dataloader))
         has_labels = all(dummy_inputs.get(k) is not None for k in self.label_names)
+        use_cache = ORTFeaturesManager.do_use_cache(self.feature)
 
         if self.onnx_model_path and (has_labels == self.exported_with_loss):
             logger.info("[INFO] Inference with given ONNX model")
@@ -966,14 +972,21 @@ class ORTTrainer(Trainer):
 
             # With `label_smoother` the loss will be computed outside modeling
             with_loss = has_labels and not self.label_smoother
-            self._export(onnx_model_path, with_loss=with_loss, device=export_device)
+            self._export(onnx_model_path, with_loss=with_loss, device=export_device, use_cache=use_cache)
 
             self.exported_with_loss = with_loss
             self.onnx_model_path = onnx_model_path.as_posix()
             logger.info("[INFO] ONNX model is stored in:\n", self.onnx_model_path)
 
         # Load ORT model
-        if not self.exported_with_loss and self.feature in ORTFeaturesManager.SUPPORTED_FEATURES:
+        support_loss_in_modeling = self.feature in [
+            "causal-lm",
+            "causal-lm-with-past",
+            "seq2seq-lm",
+            "seq2seq-lm-with-past",
+        ]
+        support_feature = self.feature in ORTFeaturesManager.SUPPORTED_FEATURES
+        if support_loss_in_modeling or (not self.exported_with_loss and support_feature):
             # Exported with standard outputs, use specific ORTModels
             ort_model_cls = ORTFeaturesManager.get_model_class_for_feature(self.feature)
         else:
@@ -981,14 +994,10 @@ class ORTTrainer(Trainer):
 
         model_id = self.onnx_model_path
         args = self.args
-        # Temporary fix for decoder, now `use_cache` set to False which
-        # TODO: Use cache once `ORTModelForCausalLM` supports `loss` as output
         if ort_model_cls is ORTModelForCausalLM:
-            ort_model = ort_model_cls.from_pretrained(
-                model_id=model_id, use_cache=False, provider="CUDAExecutionProvider"
-            )
+            ort_model = ort_model_cls.from_pretrained(model_id=model_id, use_cache=use_cache).to(args.device)
         else:
-            ort_model = ort_model_cls.from_pretrained(model_id=model_id, provider="CUDAExecutionProvider")
+            ort_model = ort_model_cls.from_pretrained(model_id=model_id).to(args.device)
 
         prediction_loss_only = prediction_loss_only if prediction_loss_only is not None else args.prediction_loss_only
 
@@ -1178,6 +1187,7 @@ class ORTTrainer(Trainer):
         # Check if there are labels in the dataset
         dummy_inputs = next(iter(dataloader))
         has_labels = all(dummy_inputs.get(k) is not None for k in self.label_names)
+        use_cache = ORTFeaturesManager.do_use_cache(self.feature)
 
         if self.onnx_model_path and (has_labels == self.exported_with_loss):
             logger.info("[INFO] Inference with given ONNX model")
@@ -1193,14 +1203,21 @@ class ORTTrainer(Trainer):
 
             # With `label_smoother` the loss will be computed outside modeling
             with_loss = has_labels and not self.label_smoother
-            self._export(onnx_model_path, with_loss=with_loss, device=export_device)
+            self._export(onnx_model_path, with_loss=with_loss, device=export_device, use_cache=use_cache)
 
             self.exported_with_loss = with_loss
             self.onnx_model_path = onnx_model_path.as_posix()
             logger.info("[INFO] ONNX model is stored in:\n", self.onnx_model_path)
 
         # Load ORT model
-        if not self.exported_with_loss and self.feature in ORTFeaturesManager.SUPPORTED_FEATURES:
+        support_loss_in_modeling = self.feature in [
+            "causal-lm",
+            "causal-lm-with-past",
+            "seq2seq-lm",
+            "seq2seq-lm-with-past",
+        ]
+        support_feature = self.feature in ORTFeaturesManager.SUPPORTED_FEATURES
+        if support_loss_in_modeling or (not self.exported_with_loss and support_feature):
             # Exported with standard outputs, use specific ORTModels
             ort_model_cls = ORTFeaturesManager.get_model_class_for_feature(self.feature)
         else:
@@ -1208,14 +1225,10 @@ class ORTTrainer(Trainer):
 
         model_id = self.onnx_model_path
         args = self.args
-        # Temporary fix for decoder, now `use_cache` set to False which cause overhead on re-computing past keys and values.
-        # TODO: Use cache once `ORTModelForCausalLM` supports `loss` as output
         if ort_model_cls is ORTModelForCausalLM:
-            ort_model = ort_model_cls.from_pretrained(
-                model_id=model_id, use_cache=False, provider="CUDAExecutionProvider"
-            )
+            ort_model = ort_model_cls.from_pretrained(model_id=model_id, use_cache=use_cache).to(args.device)
         else:
-            ort_model = ort_model_cls.from_pretrained(model_id=model_id, provider="CUDAExecutionProvider")
+            ort_model = ort_model_cls.from_pretrained(model_id=model_id).to(args.device)
 
         if not has_length(dataloader):
             raise ValueError("dataloader must implement a working __len__")
@@ -1449,6 +1462,7 @@ class ORTTrainer(Trainer):
         opset: Optional[int] = None,
         device: str = "cpu",
         with_loss: bool = True,
+        use_cache: bool = False,
     ) -> None:
         """
         Load and export a model to an ONNX format.
@@ -1471,14 +1485,6 @@ class ORTTrainer(Trainer):
                 self.model.to("cpu")
             model = unwrap_model(self.model)
 
-        # TODO: Remove once `ORTModelForCausalLM` supports `loss` as an output
-        if "-with-past" in self.feature:
-            correct_feature = self.feature.replace("-with-past", "")
-            raise NotImplementedError(
-                "`use_cache` is not yet supported for ONNX Runtime inference in `ORTTrainer`, please replace "
-                f"{self.feature} task by {correct_feature}."
-            )
-
         onnx_config_constructor = TasksManager.get_exporter_config_constructor(
             model=model, exporter="onnx", task=self.feature
         )
@@ -1487,18 +1493,42 @@ class ORTTrainer(Trainer):
 
         is_decoder = isinstance(onnx_config, OnnxConfigWithPast)
 
-        if with_loss:
-            onnx_config = wrap_onnx_config_for_loss(onnx_config)
-            opset = max(opset, 12)  # Operators like `nll_loss`are added for opset>=12
+        if is_decoder:
+            output_names = [ONNX_DECODER_NAME]
+            if use_cache is True:
+                output_names.append(ONNX_DECODER_WITH_PAST_NAME)
 
-        output_path = model_path / ONNX_DECODER_NAME if is_decoder else model_path / ONNX_WEIGHTS_NAME
-        _ = export(
-            model=model,
-            config=onnx_config,
-            opset=opset,
-            output=output_path,
-            device=device,
-        )
+            models_and_onnx_configs = get_decoder_models_for_export(model, onnx_config)
+            if with_loss is True:
+                opset = max(opset, 12)
+                models_and_onnx_configs_with_loss = {}
+                for decoder_name, (decoder, decoder_config) in models_and_onnx_configs.items():
+                    models_and_onnx_configs_with_loss[decoder_name] = (
+                        decoder,
+                        wrap_onnx_config_for_loss(decoder_config),
+                    )
+
+            export_models(
+                models_and_onnx_configs=models_and_onnx_configs_with_loss if with_loss else models_and_onnx_configs,
+                opset=opset,
+                output_dir=model_path,
+                output_names=output_names,
+                device=device,
+                disable_dynamic_axes_fix=True,  # onnxruntime floating point exception (core dumped)
+            )
+        else:
+            if with_loss is True:
+                onnx_config = wrap_onnx_config_for_loss(onnx_config)
+                opset = max(opset, 12)  # Operators like `nll_loss`are added for opset>=12
+
+            output_path = model_path / ONNX_WEIGHTS_NAME
+            _ = export(
+                model=model,
+                config=onnx_config,
+                opset=opset,
+                output=output_path,
+                device=device,
+            )
 
         model.config.save_pretrained(model_path)
 
@@ -1536,7 +1566,7 @@ class ORTTrainer(Trainer):
         if self.use_apex and training:
             model, self.optimizer = amp.initialize(model, self.optimizer, opt_level=self.args.fp16_opt_level)
 
-            if args.fp16:
+            if self.args.fp16:
                 from onnxruntime.training.optim.fp16_optimizer import FP16_Optimizer
 
                 self.optimizer = FP16_Optimizer(self.optimizer)
@@ -1569,9 +1599,8 @@ class ORTTrainer(Trainer):
         # Distributed training using PyTorch FSDP
         elif self.fsdp is not None:
             # PyTorch FSDP!
-            from torch.distributed.fsdp.fully_sharded_data_parallel import CPUOffload
+            from torch.distributed.fsdp.fully_sharded_data_parallel import CPUOffload, MixedPrecision
             from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
-            from torch.distributed.fsdp.fully_sharded_data_parallel import MixedPrecision
             from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer_auto_wrap_policy
 
             if FSDPOption.OFFLOAD in self.args.fsdp:

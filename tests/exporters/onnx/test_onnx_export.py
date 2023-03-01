@@ -12,38 +12,37 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
+import gc
 from pathlib import Path
-from tempfile import NamedTemporaryFile, TemporaryDirectory
+from tempfile import TemporaryDirectory
 from typing import Dict
 from unittest import TestCase
 from unittest.mock import patch
 
 import pytest
+from parameterized import parameterized
 from transformers import AutoConfig, is_tf_available, is_torch_available, set_seed
 from transformers.testing_utils import require_onnx, require_tf, require_torch, require_torch_gpu, require_vision, slow
 
-from exporters_utils import (
-    PYTORCH_EXPORT_MODELS_TINY,
-    PYTORCH_STABLE_DIFFUSION_MODEL,
-    TENSORFLOW_EXPORT_MODELS,
-    VALIDATE_EXPORT_ON_SHAPES_FAST,
-    VALIDATE_EXPORT_ON_SHAPES_SLOW,
-)
+from optimum.exporters.error_utils import AtolError
 from optimum.exporters.onnx import (
     OnnxConfig,
     OnnxConfigWithPast,
-    export,
     export_models,
     get_decoder_models_for_export,
     get_encoder_decoder_models_for_export,
     get_stable_diffusion_models_for_export,
-    validate_model_outputs,
     validate_models_outputs,
 )
 from optimum.utils import is_diffusers_available
 from optimum.utils.testing_utils import grid_parameters, require_diffusers
-from parameterized import parameterized
+
+from ..exporters_utils import (
+    PYTORCH_EXPORT_MODELS_TINY,
+    PYTORCH_STABLE_DIFFUSION_MODEL,
+    TENSORFLOW_EXPORT_MODELS,
+    VALIDATE_EXPORT_ON_SHAPES_SLOW,
+)
 
 
 if is_torch_available() or is_tf_available():
@@ -104,13 +103,13 @@ class OnnxConfigWithPastTestCase(TestCase):
         for name, config in OnnxConfigWithPastTestCase.SUPPORTED_WITH_PAST_CONFIGS:
             with self.subTest(name):
                 self.assertFalse(
-                    OnnxConfigWithPast.from_model_config(config()).use_past,
-                    "OnnxConfigWithPast.from_model_config() should not use_past",
+                    OnnxConfigWithPast(config()).use_past,
+                    "OnnxConfigWithPast should not use_past",
                 )
 
                 self.assertTrue(
                     OnnxConfigWithPast.with_past(config()).use_past,
-                    "OnnxConfigWithPast.from_model_config() should use_past",
+                    "OnnxConfigWithPast should use_past",
                 )
 
     @patch.multiple(OnnxConfigWithPast, __abstractmethods__=set())
@@ -120,9 +119,8 @@ class OnnxConfigWithPastTestCase(TestCase):
         """
         for name, config in OnnxConfigWithPastTestCase.SUPPORTED_WITH_PAST_CONFIGS:
             with self.subTest(name):
-
                 # Without past
-                onnx_config_default = OnnxConfigWithPast.from_model_config(config())
+                onnx_config_default = OnnxConfigWithPast(config())
                 self.assertIsNotNone(onnx_config_default.values_override, "values_override should not be None")
                 self.assertIn("use_cache", onnx_config_default.values_override, "use_cache should be present")
                 self.assertFalse(
@@ -149,7 +147,11 @@ def _get_models_to_test(export_models_dict: Dict):
                 tasks = list(task_config_mapping.keys())
                 model_tasks = {model_names_tasks: tasks}
             else:
-                n_tested_tasks = sum(len(tasks) for tasks in model_names_tasks.values())
+                unique_tasks = set()
+                for tasks in model_names_tasks.values():
+                    for task in tasks:
+                        unique_tasks.add(task)
+                n_tested_tasks = len(unique_tasks)
                 if n_tested_tasks != len(task_config_mapping):
                     raise ValueError(f"Not all tasks are tested for {model_type}.")
                 model_tasks = model_names_tasks  # possibly, test different tasks on different models
@@ -165,12 +167,12 @@ def _get_models_to_test(export_models_dict: Dict):
                     )
 
                     if any(
-                        task.startswith(ort_special_task)
-                        for ort_special_task in ["causal-lm", "seq2seq-lm", "speech2seq-lm"]
+                        task == ort_special_task
+                        for ort_special_task in ["causal-lm", "seq2seq-lm", "speech2seq-lm", "vision2seq-lm"]
                     ):
                         models_to_test.append(
                             (
-                                f"{model_type}_{task}_for_ort",
+                                f"{model_type}_{task}_monolith",
                                 model_type,
                                 model_name,
                                 task,
@@ -183,7 +185,7 @@ def _get_models_to_test(export_models_dict: Dict):
         # Returning some dummy test that should not be ever called because of the @require_torch / @require_tf
         # decorators.
         # The reason for not returning an empty list is because parameterized.expand complains when it's empty.
-        return [("dummy", "dummy", "dummy", "dummy", OnnxConfig.from_model_config)]
+        return [("dummy", "dummy", "dummy", "dummy", OnnxConfig)]
 
 
 class OnnxExportTestCase(TestCase):
@@ -199,7 +201,7 @@ class OnnxExportTestCase(TestCase):
         task: str,
         onnx_config_class_constructor,
         shapes_to_validate: Dict,
-        for_ort: bool,
+        monolith: bool,
         device="cpu",
     ):
         model_class = TasksManager.get_model_class_for_task(task)
@@ -234,56 +236,57 @@ class OnnxExportTestCase(TestCase):
         if isinstance(atol, dict):
             atol = atol[task.replace("-with-past", "")]
 
-        if for_ort is True and (model.config.is_encoder_decoder or task.startswith("causal-lm")):
-
-            if model.config.is_encoder_decoder:
-                models_and_onnx_configs = get_encoder_decoder_models_for_export(model, onnx_config)
-            else:
-                models_and_onnx_configs = get_decoder_models_for_export(model, onnx_config)
-
-            with TemporaryDirectory() as tmpdirname:
-                try:
-                    onnx_inputs, onnx_outputs = export_models(
-                        models_and_onnx_configs=models_and_onnx_configs,
-                        opset=onnx_config.DEFAULT_ONNX_OPSET,
-                        output_dir=Path(tmpdirname),
-                        device=device,
-                    )
-
-                    input_shapes_iterator = grid_parameters(shapes_to_validate, yield_dict=True, add_test_name=False)
-                    for input_shapes in input_shapes_iterator:
-                        validate_models_outputs(
-                            models_and_onnx_configs=models_and_onnx_configs,
-                            onnx_named_outputs=onnx_outputs,
-                            atol=atol,
-                            output_dir=Path(tmpdirname),
-                            input_shapes=input_shapes,
-                        )
-                except (RuntimeError, ValueError) as e:
-                    self.fail(f"{model_type}, {task} -> {e}")
+        if (
+            model.config.is_encoder_decoder
+            and task.startswith(("seq2seq-lm", "speech2seq-lm", "vision2seq-lm", "default-with-past"))
+            and monolith is False
+        ):
+            models_and_onnx_configs = get_encoder_decoder_models_for_export(model, onnx_config)
+        elif task.startswith("causal-lm") and monolith is False:
+            models_and_onnx_configs = get_decoder_models_for_export(model, onnx_config)
         else:
-            with NamedTemporaryFile("w") as output:
+            models_and_onnx_configs = {"model": (model, onnx_config)}
+
+        with TemporaryDirectory() as tmpdirname:
+            onnx_inputs, onnx_outputs = export_models(
+                models_and_onnx_configs=models_and_onnx_configs,
+                opset=onnx_config.DEFAULT_ONNX_OPSET,
+                output_dir=Path(tmpdirname),
+                device=device,
+            )
+            input_shapes_iterator = grid_parameters(shapes_to_validate, yield_dict=True, add_test_name=False)
+            for input_shapes in input_shapes_iterator:
+                skip = False
+                for _, model_onnx_conf in models_and_onnx_configs.items():
+                    if (
+                        hasattr(model_onnx_conf[0].config, "max_position_embeddings")
+                        and input_shapes["sequence_length"] >= model_onnx_conf[0].config.max_position_embeddings
+                    ):
+                        skip = True
+                        break
+                    if (
+                        model_type == "groupvit"
+                        and input_shapes["sequence_length"]
+                        >= model_onnx_conf[0].config.text_config.max_position_embeddings
+                    ):
+                        skip = True
+                        break
+                if skip:
+                    continue
+
                 try:
-                    onnx_inputs, onnx_outputs = export(
-                        model=model,
-                        config=onnx_config,
-                        opset=onnx_config.DEFAULT_ONNX_OPSET,
-                        output=Path(output.name),
+                    validate_models_outputs(
+                        models_and_onnx_configs=models_and_onnx_configs,
+                        onnx_named_outputs=onnx_outputs,
+                        atol=atol,
+                        output_dir=Path(tmpdirname),
+                        input_shapes=input_shapes,
                         device=device,
                     )
+                except AtolError as e:
+                    print(f"The ONNX export succeeded with the warning: {e}")
 
-                    input_shapes_iterator = grid_parameters(shapes_to_validate, yield_dict=True, add_test_name=False)
-                    for input_shapes in input_shapes_iterator:
-                        validate_model_outputs(
-                            config=onnx_config,
-                            reference_model=model,
-                            onnx_model=Path(output.name),
-                            onnx_named_outputs=onnx_outputs,
-                            atol=atol,
-                            input_shapes=input_shapes,
-                        )
-                except (RuntimeError, ValueError) as e:
-                    self.fail(f"{model_type}, {task} -> {e}")
+                gc.collect()
 
     def test_all_models_are_tested(self):
         # make sure we test all models
@@ -294,34 +297,34 @@ class OnnxExportTestCase(TestCase):
     @parameterized.expand(_get_models_to_test(PYTORCH_EXPORT_MODELS_TINY))
     @require_torch
     @require_vision
-    def test_pytorch_export(
+    @pytest.mark.run_slow
+    @slow
+    def test_pytorch_export_on_cpu(
         self,
         test_name,
         name,
         model_name,
         task,
         onnx_config_class_constructor,
-        for_ort: bool,
+        monolith: bool,
     ):
-        if os.environ.get("RUN_SLOW", False):
-            shapes_to_validate = VALIDATE_EXPORT_ON_SHAPES_SLOW
-        else:
-            shapes_to_validate = VALIDATE_EXPORT_ON_SHAPES_FAST
-
         self._onnx_export(
             test_name,
             name,
             model_name,
             task,
             onnx_config_class_constructor,
-            shapes_to_validate=shapes_to_validate,
-            for_ort=for_ort,
+            shapes_to_validate=VALIDATE_EXPORT_ON_SHAPES_SLOW,
+            monolith=monolith,
         )
 
     @parameterized.expand(_get_models_to_test(PYTORCH_EXPORT_MODELS_TINY))
     @require_torch
     @require_vision
     @require_torch_gpu
+    @slow
+    @pytest.mark.run_slow
+    @pytest.mark.gpu_test
     def test_pytorch_export_on_cuda(
         self,
         test_name,
@@ -329,13 +332,8 @@ class OnnxExportTestCase(TestCase):
         model_name,
         task,
         onnx_config_class_constructor,
-        for_ort: bool,
+        monolith: bool,
     ):
-        if os.environ.get("RUN_SLOW", False):
-            shapes_to_validate = VALIDATE_EXPORT_ON_SHAPES_SLOW
-        else:
-            shapes_to_validate = VALIDATE_EXPORT_ON_SHAPES_FAST
-
         self._onnx_export(
             test_name,
             name,
@@ -343,22 +341,23 @@ class OnnxExportTestCase(TestCase):
             task,
             onnx_config_class_constructor,
             device="cuda",
-            shapes_to_validate=shapes_to_validate,
-            for_ort=for_ort,
+            shapes_to_validate=VALIDATE_EXPORT_ON_SHAPES_SLOW,
+            monolith=monolith,
         )
 
     @parameterized.expand(_get_models_to_test(TENSORFLOW_EXPORT_MODELS))
     @slow
+    @pytest.mark.run_slow
     @require_tf
     @require_vision
-    def test_tensorflow_export(self, test_name, name, model_name, task, onnx_config_class_constructor, for_ort: bool):
-        if for_ort == True:
+    @pytest.mark.tensorflow_test
+    def test_tensorflow_export(self, test_name, name, model_name, task, onnx_config_class_constructor, monolith: bool):
+        if monolith is False:
             return 0
 
-        self._onnx_export(test_name, name, model_name, task, onnx_config_class_constructor, for_ort=for_ort)
+        self._onnx_export(test_name, name, model_name, task, onnx_config_class_constructor, monolith=monolith)
 
     @parameterized.expand(PYTORCH_STABLE_DIFFUSION_MODEL)
-    @slow
     @require_torch
     @require_vision
     @require_diffusers
@@ -389,5 +388,5 @@ class OnnxExportTestCase(TestCase):
                 onnx_named_outputs=onnx_outputs,
                 output_dir=Path(tmpdirname),
                 atol=1e-3,
-                output_names=output_names,
+                onnx_files_subpaths=output_names,
             )

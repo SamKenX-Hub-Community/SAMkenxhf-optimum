@@ -19,7 +19,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-from packaging import version
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from transformers.deepspeed import is_deepspeed_zero3_enabled
@@ -50,10 +49,6 @@ from .trainer import ORTTrainer
 from .utils import ONNX_DECODER_NAME, ONNX_DECODER_WITH_PAST_NAME, ONNX_ENCODER_NAME, wrap_onnx_config_for_loss
 
 
-if version.parse(torch.__version__) >= version.parse("1.8"):
-    from torch.cuda.amp import autocast
-
-
 logger = logging.get_logger(__name__)
 
 
@@ -64,7 +59,7 @@ class ORTSeq2SeqTrainer(ORTTrainer):
         ignore_keys: Optional[List[str]] = None,
         metric_key_prefix: str = "eval",
         inference_with_ort: bool = False,
-        **gen_kwargs
+        **gen_kwargs,
     ) -> Dict[str, float]:
         """
         Run evaluation with ONNX Runtime or PyTorch backend and returns metrics.
@@ -107,7 +102,7 @@ class ORTSeq2SeqTrainer(ORTTrainer):
         ignore_keys: Optional[List[str]] = None,
         metric_key_prefix: str = "eval",
         inference_with_ort: bool = False,
-        **gen_kwargs
+        **gen_kwargs,
     ) -> PredictionOutput:
         """
         Run prediction and returns predictions and potential metrics.
@@ -165,7 +160,6 @@ class ORTSeq2SeqTrainer(ORTTrainer):
         ignore_keys: Optional[List[str]] = None,
         metric_key_prefix: str = "eval",
     ) -> EvalLoopOutput:
-
         """
         Prediction/evaluation loop, shared by `ORTTrainer.evaluate()` and `ORTTrainer.predict()`.
 
@@ -201,9 +195,7 @@ class ORTSeq2SeqTrainer(ORTTrainer):
 
         args = self.args
         # Load ORT model
-        self.ort_model = ORTModelForSeq2SeqLM.from_pretrained(
-            model_id=self.onnx_model_path, provider="CUDAExecutionProvider"
-        )
+        self.ort_model = ORTModelForSeq2SeqLM.from_pretrained(model_id=self.onnx_model_path).to(args.device)
 
         prediction_loss_only = prediction_loss_only if prediction_loss_only is not None else args.prediction_loss_only
 
@@ -586,7 +578,10 @@ class ORTSeq2SeqTrainer(ORTTrainer):
         else:
             generation_inputs = inputs[self.model.main_input_name]
 
-        generated_tokens = model.generate(
+        if torch.cuda.is_available():
+            self.model.to("cuda")
+
+        generated_tokens = self.model.generate(
             generation_inputs,
             **gen_kwargs,
         )
@@ -776,8 +771,6 @@ class ORTSeq2SeqTrainer(ORTTrainer):
                 self.model.to("cpu")
             model = unwrap_model(self.model)
 
-        use_cache = kwargs.get("use_cache", True)
-
         onnx_config_constructor = TasksManager.get_exporter_config_constructor(
             model=model, exporter="onnx", task=self.feature
         )
@@ -814,7 +807,9 @@ class ORTSeq2SeqTrainer(ORTTrainer):
             output=Path(save_dir).joinpath(ONNX_DECODER_NAME),
             device=device,
         )
+
         # Export the decoder with the past key values
+        use_cache = kwargs.get("use_cache", True)
         if use_cache:
             export(
                 model=model,

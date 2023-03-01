@@ -17,14 +17,19 @@
 from typing import Any, Dict, Optional, Union
 
 from transformers import (
+    AudioClassificationPipeline,
+    AutoConfig,
     AutomaticSpeechRecognitionPipeline,
     FeatureExtractionPipeline,
+    FillMaskPipeline,
     ImageClassificationPipeline,
     ImageSegmentationPipeline,
+    ImageToTextPipeline,
     Pipeline,
     PreTrainedTokenizer,
     PreTrainedTokenizerFast,
     QuestionAnsweringPipeline,
+    SequenceFeatureExtractor,
     SummarizationPipeline,
     Text2TextGenerationPipeline,
     TextClassificationPipeline,
@@ -37,34 +42,42 @@ from transformers import pipeline as transformers_pipeline
 from transformers.feature_extraction_utils import PreTrainedFeatureExtractor
 from transformers.onnx.utils import get_preprocessor
 from transformers.pipelines import SUPPORTED_TASKS as TRANSFORMERS_SUPPORTED_TASKS
+from transformers.pipelines import infer_framework_load_model
 
 from .bettertransformer import BetterTransformer
 from .utils import is_onnxruntime_available
 from .utils.file_utils import find_files_matching_pattern
 
 
-SUPPORTED_TASKS = {}
-
 if is_onnxruntime_available():
     from .onnxruntime import (
+        ORTModelForAudioClassification,
         ORTModelForCausalLM,
         ORTModelForFeatureExtraction,
         ORTModelForImageClassification,
+        ORTModelForMaskedLM,
         ORTModelForQuestionAnswering,
         ORTModelForSemanticSegmentation,
         ORTModelForSeq2SeqLM,
         ORTModelForSequenceClassification,
         ORTModelForSpeechSeq2Seq,
         ORTModelForTokenClassification,
+        ORTModelForVision2Seq,
     )
     from .onnxruntime.modeling_ort import ORTModel
 
-    SUPPORTED_TASKS = {
+    ORT_SUPPORTED_TASKS = {
         "feature-extraction": {
             "impl": FeatureExtractionPipeline,
             "class": (ORTModelForFeatureExtraction,),
             "default": "distilbert-base-cased",
             "type": "text",  # feature extraction is only supported for text at the moment
+        },
+        "fill-mask": {
+            "impl": FillMaskPipeline,
+            "class": (ORTModelForMaskedLM,),
+            "default": "bert-base-cased",
+            "type": "text",
         },
         "image-classification": {
             "impl": ImageClassificationPipeline,
@@ -132,17 +145,19 @@ if is_onnxruntime_available():
             "default": "openai/whisper-tiny.en",
             "type": "multimodal",
         },
+        "image-to-text": {
+            "impl": ImageToTextPipeline,
+            "class": (ORTModelForVision2Seq,),
+            "default": "nlpconnect/vit-gpt2-image-captioning",
+            "type": "multimodal",
+        },
+        "audio-classification": {
+            "impl": AudioClassificationPipeline,
+            "class": (ORTModelForAudioClassification,),
+            "default": "superb/hubert-base-superb-ks",
+            "type": "audio",
+        },
     }
-
-NO_FEATURE_EXTRACTOR_TASKS = set()
-NO_TOKENIZER_TASKS = set()
-for task, values in SUPPORTED_TASKS.items():
-    if values["type"] == "text":
-        NO_FEATURE_EXTRACTOR_TASKS.add(task)
-    elif values["type"] == "image":
-        NO_TOKENIZER_TASKS.add(task)
-    elif values["type"] != "multimodal":
-        raise ValueError(f"SUPPORTED_TASK {task} contains invalid type {values['type']}")
 
 
 def load_bettertransformer(
@@ -157,21 +172,34 @@ def load_bettertransformer(
     use_auth_token: Optional[Union[bool, str]] = None,
     revision: str = "main",
     model_kwargs: Optional[Dict[str, Any]] = None,
-    **kwargs
+    config: AutoConfig = None,
+    hub_kwargs: Optional[Dict] = None,
+    **kwargs,
 ):
     if model_kwargs is None:
         model_kwargs = {}
 
     if model is None:
-        model_id = TRANSFORMERS_SUPPORTED_TASKS[targeted_task]["default"]
-        model = TRANSFORMERS_SUPPORTED_TASKS[targeted_task]["pt"][0].from_pretrained(model_id, **model_kwargs)
+        model_id = SUPPORTED_TASKS[targeted_task]["default"]
     elif isinstance(model, str):
         model_id = model
-        model = TRANSFORMERS_SUPPORTED_TASKS[targeted_task]["pt"][0].from_pretrained(model, **model_kwargs)
     else:
-        raise ValueError(
-            f"""Model {model} is not supported. Please provide a valid model either as string or ORTModel.
-            You can also provide non model then a default one will be used"""
+        model_id = None
+
+    model_classes = {"pt": SUPPORTED_TASKS[targeted_task]["pt"]}
+    framework, model = infer_framework_load_model(
+        model,
+        model_classes=model_classes,
+        config=config,
+        framework="pt",
+        task=targeted_task,
+        **hub_kwargs,
+        **model_kwargs,
+    )
+
+    if framework == "tf":
+        raise NotImplementedError(
+            "BetterTransormer is PyTorch-specific. It will not work with the provided TensorFlow model."
         )
 
     model = BetterTransformer.transform(model, **kwargs)
@@ -191,7 +219,8 @@ def load_ort_pipeline(
     use_auth_token: Optional[Union[bool, str]] = None,
     revision: str = "main",
     model_kwargs: Optional[Dict[str, Any]] = None,
-    **kwargs
+    config: AutoConfig = None,
+    **kwargs,
 ):
     if model_kwargs is None:
         model_kwargs = {}
@@ -232,7 +261,7 @@ def load_ort_pipeline(
                 )
         if feature_extractor is None and load_feature_extractor:
             for preprocessor in model.preprocessors:
-                if isinstance(preprocessor, PreTrainedFeatureExtractor):
+                if isinstance(preprocessor, SequenceFeatureExtractor):
                     feature_extractor = preprocessor
                     break
             if feature_extractor is None:
@@ -263,15 +292,17 @@ def pipeline(
     use_fast: bool = True,
     use_auth_token: Optional[Union[str, bool]] = None,
     accelerator: Optional[str] = "ort",
+    revision: Optional[str] = None,
+    trust_remote_code: Optional[bool] = None,
     *model_kwargs,
     **kwargs,
 ) -> Pipeline:
     targeted_task = "translation" if task.startswith("translation") else task
 
     if accelerator == "ort":
-        if targeted_task not in list(SUPPORTED_TASKS.keys()):
+        if targeted_task not in list(ORT_SUPPORTED_TASKS.keys()):
             raise ValueError(
-                f"Task {targeted_task} is not supported. Supported tasks are { list(SUPPORTED_TASKS.keys())}"
+                f"Task {targeted_task} is not supported for the ONNX Runtime pipeline. Supported tasks are { list(ORT_SUPPORTED_TASKS.keys())}"
             )
 
     if accelerator not in MAPPING_LOADING_FUNC:
@@ -279,8 +310,35 @@ def pipeline(
             f'Accelerator {accelerator} is not supported. Supported accelerators are "ort" and "bettertransformer".'
         )
 
+    # copied from transformers.pipelines.__init__.py
+    hub_kwargs = {
+        "revision": revision,
+        "use_auth_token": use_auth_token,
+        "trust_remote_code": trust_remote_code,
+        "_commit_hash": None,
+    }
+
+    config = kwargs.get("config", None)
+    if config is None and isinstance(model, str):
+        config = AutoConfig.from_pretrained(model, _from_pipeline=task, **hub_kwargs, **kwargs)
+        hub_kwargs["_commit_hash"] = config._commit_hash
+
+    supported_tasks = ORT_SUPPORTED_TASKS if accelerator == "ort" else TRANSFORMERS_SUPPORTED_TASKS
+
+    no_feature_extractor_tasks = set()
+    no_tokenizer_tasks = set()
+    for _task, values in supported_tasks.items():
+        if values["type"] == "text":
+            no_feature_extractor_tasks.add(_task)
+        elif values["type"] in {"image", "video"}:
+            no_tokenizer_tasks.add(_task)
+        elif values["type"] in {"audio"}:
+            no_tokenizer_tasks.add(_task)
+        elif values["type"] not in ["multimodal", "audio", "video"]:
+            raise ValueError(f"SUPPORTED_TASK {_task} contains invalid type {values['type']}")
+
     # copied from transformers.pipelines.__init__.py l.609
-    if targeted_task in NO_TOKENIZER_TASKS:
+    if targeted_task in no_tokenizer_tasks:
         # These will never require a tokenizer.
         # the model on the other hand might have a tokenizer, but
         # the files could be missing from the hub, instead of failing
@@ -288,7 +346,8 @@ def pipeline(
         load_tokenizer = False
     else:
         load_tokenizer = True
-    if targeted_task in NO_FEATURE_EXTRACTOR_TASKS:
+
+    if targeted_task in no_feature_extractor_tasks:
         load_feature_extractor = False
     else:
         load_feature_extractor = True
@@ -300,7 +359,9 @@ def pipeline(
         tokenizer,
         feature_extractor,
         load_feature_extractor,
-        SUPPORTED_TASKS,
+        SUPPORTED_TASKS=supported_tasks,
+        config=config,
+        hub_kwargs=hub_kwargs,
         *model_kwargs,
         **kwargs,
     )
