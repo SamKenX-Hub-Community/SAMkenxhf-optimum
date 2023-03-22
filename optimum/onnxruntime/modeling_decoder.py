@@ -20,17 +20,14 @@ from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
-from huggingface_hub import hf_hub_download
-from huggingface_hub.utils import EntryNotFoundError
 from transformers import AutoModelForCausalLM, GenerationConfig
 from transformers.file_utils import add_start_docstrings_to_model_forward
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 
 import onnxruntime
 
-from ..exporters import TasksManager
-from ..exporters.onnx import export_models, get_decoder_models_for_export
-from ..onnx.utils import _get_external_data_paths, has_onnx_input
+from ..exporters.onnx import main_export
+from ..onnx.utils import _get_external_data_paths
 from ..utils import check_if_transformers_greater
 from ..utils.file_utils import validate_file_exists
 from ..utils.save_utils import maybe_load_preprocessors, maybe_save_preprocessors
@@ -131,6 +128,7 @@ class ORTModelDecoder(ORTModel):
         self,
         decoder_session: onnxruntime.InferenceSession,
         config: "PretrainedConfig",
+        onnx_paths: List[str],
         decoder_with_past_session: Optional[onnxruntime.InferenceSession] = None,
         use_cache: bool = True,
         use_io_binding: Optional[bool] = None,
@@ -149,6 +147,8 @@ class ORTModelDecoder(ORTModel):
             decoder_with_past_session (`Optional[onnxruntime.InferenceSession]`, defaults to `None`):
                 The ONNX Runtime inference session associated to the decoder with past key values. This argument should not
                 be set if use_merged=True is used.
+            onnx_paths (`List[str]`):
+                Path to ONNX files associated with the model.
             use_cache (`bool`, defaults to `True`):
                 Whether or not past key/values cache should be used. Defaults to `True`.
             use_io_binding (`Optional[bool]`, defaults to `None`):
@@ -208,7 +208,7 @@ class ORTModelDecoder(ORTModel):
                     "The parameter decoder_with_past_session was passed, although use_cache is False."
                     "Please pass use_cache=True for decoder_with_past_session to be used."
                 )
-
+        self.onnx_paths = onnx_paths
         self.use_cache = use_cache
         self.use_merged = use_merged
         self.decoder = ORTDecoder(decoder_session, self)
@@ -285,18 +285,14 @@ class ORTModelDecoder(ORTModel):
             save_directory (`str` or `Path`):
                 The directory where to save the model files.
         """
-        src_paths = [self.decoder_model_path]
-        dst_file_names = [self.decoder_model_path.name]
-
-        if self.use_cache and not self.use_merged:
-            src_paths.append(self.decoder_with_past_model_path)
-            dst_file_names.append(self.decoder_with_past_model_path.name)
+        save_directory = Path(save_directory)
+        src_paths = [Path(path) for path in self.onnx_paths]
+        dst_paths = [save_directory / path.name for path in src_paths]
 
         # add external data paths in case of large models
-        src_paths, dst_file_names = _get_external_data_paths(src_paths, dst_file_names)
+        src_paths, dst_paths = _get_external_data_paths(src_paths, dst_paths)
 
-        for src_path, dst_file_name in zip(src_paths, dst_file_names):
-            dst_path = Path(save_directory) / dst_file_name
+        for src_path, dst_path in zip(src_paths, dst_paths):
             shutil.copyfile(src_path, dst_path)
 
     @classmethod
@@ -313,6 +309,7 @@ class ORTModelDecoder(ORTModel):
         subfolder: str = "",
         local_files_only: bool = False,
         use_cache: bool = True,
+        use_merged: Optional[bool] = None,
         provider: str = "CPUExecutionProvider",
         session_options: Optional[onnxruntime.SessionOptions] = None,
         provider_options: Optional[Dict[str, Any]] = None,
@@ -322,17 +319,43 @@ class ORTModelDecoder(ORTModel):
     ):
         model_path = Path(model_id)
 
+        decoder_merged_path = None
+        if use_merged is not False:
+            try:
+                decoder_merged_path = ORTModelDecoder.infer_onnx_filename(
+                    model_id,
+                    [DECODER_MERGED_ONNX_FILE_PATTERN],
+                    argument_name=None,
+                    subfolder=subfolder,
+                    use_auth_token=use_auth_token,
+                    revision=revision,
+                )
+                use_merged = True
+            except FileNotFoundError as e:
+                if use_merged is True:
+                    raise FileNotFoundError(
+                        "The parameter `use_merged=True` was passed to ORTModelForCausalLM.from_pretrained()"
+                        " but no ONNX file for a merged decoder could be found in"
+                        f" {str(Path(model_id, subfolder))}, with the error: {e}"
+                    )
+                use_merged = False
+
         if not validate_file_exists(model_id, decoder_file_name, subfolder=subfolder, revision=revision):
-            decoder_path = ORTModelDecoder.infer_onnx_filename(
+            decoder_without_past_path = ORTModelDecoder.infer_onnx_filename(
                 model_id,
-                [DECODER_MERGED_ONNX_FILE_PATTERN, DECODER_ONNX_FILE_PATTERN],
+                [DECODER_ONNX_FILE_PATTERN],
                 "decoder_file_name",
                 subfolder=subfolder,
                 use_auth_token=use_auth_token,
                 revision=revision,
             )
         else:
-            decoder_path = model_path / subfolder / decoder_file_name
+            decoder_without_past_path = model_path / subfolder / decoder_file_name
+
+        if use_merged is True:
+            decoder_path = decoder_merged_path
+        else:
+            decoder_path = decoder_without_past_path
 
         decoder_regular_onnx_filenames = ORTModelDecoder._generate_regular_names_for_filename(ONNX_DECODER_NAME)
         if decoder_path.name not in decoder_regular_onnx_filenames:
@@ -341,31 +364,29 @@ class ORTModelDecoder(ORTModel):
                 f"{cls.__name__} might not behave as expected."
             )
 
-        decoder_with_past_path = None
-        use_merged = has_onnx_input(decoder_path, "use_cache_branch")
-
         # If the decoder without / with past has been merged, we do not need to look for any additional file
         decoder_with_past_path = None
-        if use_cache is True and not use_merged:
-            if not validate_file_exists(model_id, decoder_with_past_file_name, subfolder=subfolder, revision=revision):
-                try:
-                    decoder_with_past_path = ORTModelDecoder.infer_onnx_filename(
-                        model_id,
-                        [DECODER_WITH_PAST_ONNX_FILE_PATTERN],
-                        "decoder_with_past_file_name",
-                        subfolder=subfolder,
-                        use_auth_token=use_auth_token,
-                        revision=revision,
-                    )
-                except FileNotFoundError as e:
+        if not validate_file_exists(model_id, decoder_with_past_file_name, subfolder=subfolder, revision=revision):
+            try:
+                decoder_with_past_path = ORTModelDecoder.infer_onnx_filename(
+                    model_id,
+                    [DECODER_WITH_PAST_ONNX_FILE_PATTERN],
+                    "decoder_with_past_file_name",
+                    subfolder=subfolder,
+                    use_auth_token=use_auth_token,
+                    revision=revision,
+                )
+            except FileNotFoundError as e:
+                if use_cache is True and use_merged is False:
                     raise FileNotFoundError(
-                        "The parameter `use_cache=True` was passed to ORTModelDecoder.from_pretrained()"
+                        "The parameter `use_cache=True` was passed to ORTModelForCausalLM.from_pretrained()"
                         " but no ONNX file using past key values could be found in"
-                        f" {str(Path(model_id, subfolder))}, with the error:\n    {e}"
+                        f" {str(Path(model_id, subfolder))}, with the error: {e}"
                     )
-            else:
-                decoder_with_past_path = model_path / subfolder / decoder_with_past_file_name
+        else:
+            decoder_with_past_path = model_path / subfolder / decoder_with_past_file_name
 
+        if use_cache is True and use_merged is False:
             decoder_with_past_regular_onnx_filenames = ORTModelDecoder._generate_regular_names_for_filename(
                 ONNX_DECODER_WITH_PAST_NAME
             )
@@ -380,57 +401,16 @@ class ORTModelDecoder(ORTModel):
         if model_path.is_dir():
             new_model_save_dir = model_path
             preprocessors = maybe_load_preprocessors(model_id)
-        else:
-            attribute_name_to_filename = {
-                "last_decoder_model_name": decoder_path.name,
-                "last_decoder_with_past_model_name": decoder_with_past_path.name
-                if decoder_with_past_path is not None
-                else None,
-            }
-            paths = {}
-            for attr_name, filename in attribute_name_to_filename.items():
-                if filename is None:
-                    continue
-                model_cache_path = hf_hub_download(
-                    repo_id=model_id,
-                    subfolder=subfolder,
-                    filename=filename,
-                    use_auth_token=use_auth_token,
-                    revision=revision,
-                    cache_dir=cache_dir,
-                    force_download=force_download,
-                    local_files_only=local_files_only,
-                )
 
-                # try download external data
-                try:
-                    hf_hub_download(
-                        repo_id=model_id,
-                        subfolder=subfolder,
-                        filename=filename + "_data",
-                        use_auth_token=use_auth_token,
-                        revision=revision,
-                        cache_dir=cache_dir,
-                        force_download=force_download,
-                        local_files_only=local_files_only,
-                    )
-                except EntryNotFoundError:
-                    # model doesn't use external data
-                    pass
-
-                paths[attr_name] = Path(model_cache_path).name
-            new_model_save_dir = Path(model_cache_path).parent
-            preprocessors = maybe_load_preprocessors(model_id, subfolder=subfolder)
-
-            last_decoder_with_past_name = paths.get("last_decoder_with_past_model_name", None)
-            if last_decoder_with_past_name is not None:
-                decoder_with_past_path = new_model_save_dir / last_decoder_with_past_name
-
-            decoder_path = new_model_save_dir / paths["last_decoder_model_name"]
+        onnx_paths = [decoder_path]
+        if use_cache is True and use_merged is False:
+            onnx_paths.append(decoder_with_past_path)
+        if use_cache is True and use_merged is True:
+            onnx_paths.append(decoder_with_past_path)
 
         ort_inference_sessions = cls.load_model(
             decoder_path=decoder_path,
-            decoder_with_past_path=decoder_with_past_path,
+            decoder_with_past_path=None if use_merged is True or use_cache is False else decoder_with_past_path,
             provider=provider,
             session_options=session_options,
             provider_options=provider_options,
@@ -453,6 +433,12 @@ class ORTModelDecoder(ORTModel):
         except OSError:
             logger.info("Generation config file not found, using a generation config created from the model config.")
 
+        onnx_paths = [decoder_without_past_path]
+        if decoder_merged_path is not None:
+            onnx_paths.append(decoder_merged_path)
+        if decoder_with_past_path is not None:
+            onnx_paths.append(decoder_with_past_path)
+
         return cls(
             ort_inference_sessions[0],
             config,
@@ -462,6 +448,7 @@ class ORTModelDecoder(ORTModel):
             model_save_dir=model_save_dir,
             preprocessors=preprocessors,
             generation_config=generation_config,
+            onnx_paths=onnx_paths,
         )
 
     @classmethod
@@ -487,6 +474,9 @@ class ORTModelDecoder(ORTModel):
         if task is None:
             task = cls._auto_model_to_task(cls.auto_model_class)
 
+            if use_cache is True:
+                task = task + "-with-past"
+
         if use_cache is False and use_merged is True:
             raise ValueError(
                 "The incompatible arguments use_cache=False, use_merged=True were passed to ORTModelForCausalLM.from_pretrained()."
@@ -497,38 +487,20 @@ class ORTModelDecoder(ORTModel):
         save_dir = TemporaryDirectory()
         save_dir_path = Path(save_dir.name)
 
-        model = TasksManager.get_model_from_task(
-            task,
-            model_id,
+        main_export(
+            model_name_or_path=model_id,
+            output=save_dir_path,
+            task=task,
+            do_validation=False,
+            no_post_process=not use_merged,
             subfolder=subfolder,
             revision=revision,
             cache_dir=cache_dir,
-            config=config,
             use_auth_token=use_auth_token,
             local_files_only=local_files_only,
             force_download=force_download,
             trust_remote_code=trust_remote_code,
         )
-
-        onnx_config_constructor = TasksManager.get_exporter_config_constructor(model=model, exporter="onnx", task=task)
-        onnx_config = onnx_config_constructor(model.config, use_past=use_cache)
-
-        onnx_files_subpaths = [ONNX_DECODER_NAME]
-        if use_cache is True:
-            onnx_files_subpaths.append(ONNX_DECODER_WITH_PAST_NAME)
-
-        models_and_onnx_configs = get_decoder_models_for_export(model, onnx_config)
-        export_models(
-            models_and_onnx_configs=models_and_onnx_configs,
-            opset=onnx_config.DEFAULT_ONNX_OPSET,
-            output_dir=save_dir_path,
-            output_names=onnx_files_subpaths,
-        )
-
-        if use_merged is True:
-            _, _ = onnx_config.post_process_exported_models(
-                save_dir_path, models_and_onnx_configs, onnx_files_subpaths
-            )
 
         config.save_pretrained(save_dir_path)
         maybe_save_preprocessors(model_id, save_dir_path, src_subfolder=subfolder)
@@ -537,6 +509,7 @@ class ORTModelDecoder(ORTModel):
             save_dir_path,
             config,
             use_cache=use_cache,
+            use_merged=use_merged,
             provider=provider,
             session_options=session_options,
             provider_options=provider_options,

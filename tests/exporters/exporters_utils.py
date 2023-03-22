@@ -59,6 +59,7 @@ PYTORCH_EXPORT_MODELS_TINY = {
     "gptj": "hf-internal-testing/tiny-random-GPTJModel",
     "groupvit": "hf-internal-testing/tiny-random-groupvit",
     "ibert": "hf-internal-testing/tiny-random-IBertModel",
+    "imagegpt": "hf-internal-testing/tiny-random-ImageGPTModel",
     "levit": "hf-internal-testing/tiny-random-LevitModel",
     "layoutlm": "hf-internal-testing/tiny-random-LayoutLMModel",
     "layoutlmv3": "hf-internal-testing/tiny-random-LayoutLMv3Model",
@@ -74,6 +75,7 @@ PYTORCH_EXPORT_MODELS_TINY = {
     "mpnet": "hf-internal-testing/tiny-random-MPNetModel",
     "mt5": "lewtun/tiny-random-mt5",
     "nystromformer": "hf-internal-testing/tiny-random-NystromformerModel",
+    "opt": "hf-internal-testing/tiny-random-OPTModel",
     # "owlvit": "google/owlvit-base-patch32",
     "pegasus": "hf-internal-testing/tiny-random-PegasusModel",
     "perceiver": {
@@ -82,6 +84,7 @@ PYTORCH_EXPORT_MODELS_TINY = {
     },
     # "rembert": "google/rembert",
     "poolformer": "hf-internal-testing/tiny-random-PoolFormerModel",
+    "regnet": "hf-internal-testing/tiny-random-RegNetModel",
     "resnet": "hf-internal-testing/tiny-random-resnet",
     "roberta": "hf-internal-testing/tiny-random-RobertaModel",
     "roformer": "hf-internal-testing/tiny-random-RoFormerModel",
@@ -122,8 +125,6 @@ PYTORCH_EXPORT_MODELS_TINY = {
         ],
         "microsoft/trocr-small-handwritten": ["vision2seq-lm"],
     },
-    # Disabled for now because of high atol threshold requirement to pass
-    # "donut-swin": "hf-internal-testing/tiny-random-DonutSwinModel"
 }
 
 
@@ -158,6 +159,7 @@ PYTORCH_EXPORT_MODELS_LARGE = {
     "gptj": "anton-l/gpt-j-tiny-random",  # TODO
     "groupvit": "nvidia/groupvit-gcc-yfcc",
     "ibert": "kssteven/ibert-roberta-base",
+    "imagegpt": "openai/imagegpt-small",
     "levit": "facebook/levit-128S",
     "layoutlm": "microsoft/layoutlm-base-uncased",
     "layoutlmv3": "microsoft/layoutlmv3-base",
@@ -176,6 +178,7 @@ PYTORCH_EXPORT_MODELS_LARGE = {
     "perceiver": "hf-internal-testing/tiny-random-PerceiverModel",  # Not using deepmind/language-perceiver because it takes too much time for testing.
     # "rembert": "google/rembert",
     "poolformer": "hf-internal-testing/tiny-random-PoolFormerModel",
+    "regnet": "facebook/regnet-y-040",
     "resnet": "microsoft/resnet-50",
     "roberta": "roberta-base",
     "roformer": "junnyu/roformer_chinese_base",

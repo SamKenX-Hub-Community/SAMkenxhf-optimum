@@ -57,7 +57,7 @@ from transformers.modeling_outputs import (
 import onnxruntime as ort
 
 from ..exporters import TasksManager
-from ..exporters.onnx import export
+from ..exporters.onnx import main_export
 from ..modeling_base import FROM_PRETRAINED_START_DOCSTRING, OptimizedModel
 from ..onnx.utils import _get_external_data_paths
 from ..utils.file_utils import find_files_matching_pattern
@@ -164,21 +164,25 @@ class ORTModel(OptimizedModel):
         - providers (`List[str]) -- The list of execution providers available to ONNX Runtime.
     """
 
-    _AUTOMODELS_TO_TASKS = {cls_name: task for task, cls_name in TasksManager._TASKS_TO_AUTOMODELS.items()}
     model_type = "onnx_model"
     auto_model_class = AutoModel
 
     @classproperty
     def export_feature(cls):
         logger.warning(f"{cls.__name__}.export_feature is deprecated, and will be removed in optimum 2.0.")
-        return cls._AUTOMODELS_TO_TASKS.get(cls.auto_model_class.__name__, None)
+
+        try:
+            feature = TasksManager.infer_task_from_model(cls.auto_model_class)
+        except ValueError:
+            feature = None
+        return feature
 
     @classmethod
     def _auto_model_to_task(cls, auto_model_class):
         """
         Get the task corresponding to a class (for example AutoModelForXXX in transformers).
         """
-        return cls._AUTOMODELS_TO_TASKS[auto_model_class.__name__]
+        return TasksManager.infer_task_from_model(auto_model_class)
 
     def shared_attributes_init(
         self,
@@ -231,7 +235,8 @@ class ORTModel(OptimizedModel):
         # Registers the ORTModelForXXX classes into the transformers AutoModel classes to avoid warnings when creating
         # a pipeline https://github.com/huggingface/transformers/blob/cad61b68396a1a387287a8e2e2fef78a25b79383/src/transformers/pipelines/base.py#L863
         AutoConfig.register(self.model_type, AutoConfig)
-        self.auto_model_class.register(AutoConfig, self.__class__)
+        if hasattr(self.auto_model_class, "register"):
+            self.auto_model_class.register(AutoConfig, self.__class__)
 
         # Define the pattern here to avoid recomputing it everytime.
         self.output_shape_inference_pattern = re.compile(r"([a-zA-Z_]+)|([0-9]+)|([+-/*])|([\(\)])")
@@ -377,13 +382,12 @@ class ORTModel(OptimizedModel):
                 Directory where to save the model file.
         """
         src_paths = [self.model_path]
-        dst_file_names = [self.model_path.name]
+        dst_paths = [Path(save_directory) / self.model_path.name]
 
         # add external data paths in case of large models
-        src_paths, dst_file_names = _get_external_data_paths(src_paths, dst_file_names)
+        src_paths, dst_paths = _get_external_data_paths(src_paths, dst_paths)
 
-        for src_path, dst_file_name in zip(src_paths, dst_file_names):
-            dst_path = Path(save_directory) / dst_file_name
+        for src_path, dst_path in zip(src_paths, dst_paths):
             shutil.copyfile(src_path, dst_path)
 
     @staticmethod
@@ -558,35 +562,32 @@ class ORTModel(OptimizedModel):
         if task is None:
             task = cls._auto_model_to_task(cls.auto_model_class)
 
-        kwargs_to_get_model = {
-            "subfolder": subfolder,
-            "revision": revision,
-            "trust_remote_code": trust_remote_code,
-        }
+        save_dir = TemporaryDirectory()
+        save_dir_path = Path(save_dir.name)
 
-        model = TasksManager.get_model_from_task(task, model_id, **kwargs_to_get_model)
-        onnx_config_class = TasksManager.get_exporter_config_constructor(
-            model=model, exporter="onnx", task=task, model_name=model_id
+        main_export(
+            model_name_or_path=model_id,
+            output=save_dir_path,
+            task=task,
+            do_validation=False,
+            no_post_process=True,
+            subfolder=subfolder,
+            revision=revision,
+            cache_dir=cache_dir,
+            use_auth_token=use_auth_token,
+            local_files_only=local_files_only,
+            force_download=force_download,
+            trust_remote_code=trust_remote_code,
         )
 
-        onnx_config = onnx_config_class(model.config)
-
-        tmp_dir = TemporaryDirectory()
-        tmp_dir_path = Path(tmp_dir.name)
-        export(
-            model=model,
-            config=onnx_config,
-            opset=onnx_config.DEFAULT_ONNX_OPSET,
-            output=tmp_dir_path / ONNX_WEIGHTS_NAME,
-        )
-        config.save_pretrained(tmp_dir_path)
-        maybe_save_preprocessors(model_id, tmp_dir_path, src_subfolder=subfolder)
+        config.save_pretrained(save_dir_path)
+        maybe_save_preprocessors(model_id, save_dir_path, src_subfolder=subfolder)
 
         return cls._from_pretrained(
-            tmp_dir_path,
+            save_dir_path,
             config,
             use_io_binding=use_io_binding,
-            model_save_dir=tmp_dir,
+            model_save_dir=save_dir,
             provider=provider,
             session_options=session_options,
             provider_options=provider_options,
@@ -597,7 +598,7 @@ class ORTModel(OptimizedModel):
     def from_pretrained(
         cls,
         model_id: Union[str, Path],
-        from_transformers: bool = False,
+        export: bool = False,
         force_download: bool = False,
         use_auth_token: Optional[str] = None,
         cache_dir: Optional[str] = None,
@@ -621,12 +622,24 @@ class ORTModel(OptimizedModel):
         kwargs (`Dict[str, Any]`):
             Will be passed to the underlying model loading methods.
 
+        > Parameters for decoder models (ORTModelForCausalLM, ORTModelForSeq2SeqLM, ORTModelForSeq2SeqLM, ORTModelForSpeechSeq2Seq, ORTModelForVision2Seq)
+
+        use_cache (`Optional[bool]`, defaults to `True`):
+            Whether or not past key/values cache should be used. Defaults to `True`.
+
+        > Parameters for ORTModelForCausalLM
+
+        use_merged (`Optional[bool]`, defaults to `None`):
+            whether or not to use a single ONNX that handles both the decoding without and with past key values reuse. This option defaults
+            to `True` if loading from a local repository and a merged decoder is found. When exporting with `from_transformers=True`,
+            defaults to `False`. This option should be set to `True` to minimize memory usage.
+
         Returns:
             `ORTModel`: The loaded ORTModel model.
         """
         return super().from_pretrained(
             model_id,
-            from_transformers=from_transformers,
+            export=export,
             force_download=force_download,
             use_auth_token=use_auth_token,
             cache_dir=cache_dir,
@@ -1828,17 +1841,9 @@ class ORTModelForCTC(ORTModel):
         use_torch = isinstance(input_values, torch.Tensor)
         self.raise_on_numpy_input_io_binding(use_torch)
         if self.device.type == "cuda" and self.use_io_binding:
-            io_binding, output_shapes, output_buffers = self.prepare_io_binding(
-                input_values, ordered_input_names=self._ordered_input_names
+            raise NotImplementedError(
+                "IO Binding for ORTModelForCTC is currently not supported. Please open an issue or submit a PR to https://github.com/huggingface/optimum to have this feature added."
             )
-
-            # run inference with binding & synchronize in case of multiple CUDA streams
-            io_binding.synchronize_inputs()
-            self.model.run_with_iobinding(io_binding)
-            io_binding.synchronize_outputs()
-
-            # converts output to namedtuple for pipelines post-processing
-            return CausalLMOutput(logits=output_buffers["logits"].view(output_shapes["logits"]))
         else:
             if use_torch:
                 # converts pytorch inputs into numpy inputs for onnx

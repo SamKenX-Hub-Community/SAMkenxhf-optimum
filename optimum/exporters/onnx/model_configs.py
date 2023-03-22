@@ -14,9 +14,10 @@
 # limitations under the License.
 """Model specific ONNX configurations."""
 import random
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 from packaging import version
+from transformers.utils import is_tf_available
 
 from ...utils import (
     DEFAULT_DUMMY_SHAPES,
@@ -47,12 +48,18 @@ from .config import (
     TextSeq2SeqOnnxConfig,
     VisionOnnxConfig,
 )
+from .model_patcher import WavLMModelPatcher
 
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
+    from transformers.modeling_utils import PreTrainedModel
 
     from ...utils import DummyInputGenerator
+    from .model_patcher import ModelPatcher
+
+    if is_tf_available():
+        from transformers.modeling_tf_utils import TFPreTrainedModel
 
 logger = logging.get_logger(__name__)
 
@@ -182,12 +189,21 @@ class CodeGenOnnxConfig(GPT2OnnxConfig):
     pass
 
 
+class ImageGPTOnnxConfig(GPT2OnnxConfig):
+    pass
+
+
 class GPTNeoOnnxConfig(TextDecoderOnnxConfig):
     DEFAULT_ONNX_OPSET = 13
     NORMALIZED_CONFIG_CLASS = NormalizedTextConfig.with_args(num_attention_heads="num_heads")
 
 
 class GPTNeoXOnnxConfig(TextDecoderOnnxConfig):
+    DEFAULT_ONNX_OPSET = 13
+    NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
+
+
+class OPTOnnxConfig(TextDecoderOnnxConfig):
     DEFAULT_ONNX_OPSET = 13
     NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
 
@@ -227,15 +243,21 @@ class BloomOnnxConfig(TextDecoderOnnxConfig):
         if direction not in ["inputs", "outputs"]:
             raise ValueError(f'direction must either be "inputs" or "outputs", but {direction} was given')
 
-        name = "past_key_values" if direction == "inputs" else "present"
+        if direction == "inputs":
+            decoder_sequence_name = "past_sequence_length"
+            name = "past_key_values"
+        else:
+            decoder_sequence_name = "past_sequence_length + 1"
+            name = "present"
+
         for i in range(self._normalized_config.num_layers):
             inputs_or_outputs[f"{name}.{i}.key"] = {
                 0: "batch_size x num_heads",
-                2: "past_sequence_length + sequence_length",
+                2: decoder_sequence_name,
             }
             inputs_or_outputs[f"{name}.{i}.value"] = {
                 0: "batch_size x num_heads",
-                1: "past_sequence_length + sequence_length",
+                1: decoder_sequence_name,
             }
 
 
@@ -522,6 +544,11 @@ class MobileViTOnnxConfig(ViTOnnxConfig):
     pass
 
 
+class RegNetOnnxConfig(ViTOnnxConfig):
+    # This config has the same inputs as ViTOnnxConfig
+    pass
+
+
 class ResNetOnnxConfig(ViTOnnxConfig):
     ATOL_FOR_VALIDATION = 1e-3
 
@@ -580,18 +607,18 @@ class CLIPOnnxConfig(TextAndVisionOnnxConfig):
     @property
     def inputs(self) -> Dict[str, Dict[int, str]]:
         return {
-            "input_ids": {0: "batch_size", 1: "sequence_length"},
-            "pixel_values": {0: "batch_size", 1: "num_channels", 2: "height", 3: "width"},
-            "attention_mask": {0: "batch_size", 1: "sequence_length"},
+            "input_ids": {0: "text_batch_size", 1: "sequence_length"},
+            "pixel_values": {0: "image_batch_size", 1: "num_channels", 2: "height", 3: "width"},
+            "attention_mask": {0: "text_batch_size", 1: "sequence_length"},
         }
 
     @property
     def outputs(self) -> Dict[str, Dict[int, str]]:
         return {
-            "logits_per_image": {0: "batch_size"},
-            "logits_per_text": {0: "batch_size"},
-            "text_embeds": {0: "batch_size"},
-            "image_embeds": {0: "batch_size"},
+            "logits_per_image": {0: "image_batch_size", 1: "text_batch_size"},
+            "logits_per_text": {0: "text_batch_size", 1: "image_batch_size"},
+            "text_embeds": {0: "text_batch_size"},
+            "image_embeds": {0: "image_batch_size"},
         }
 
 
@@ -864,6 +891,12 @@ class UniSpeechSATOnnxConfig(HubertOnnxConfig):
 class WavLMOnnxConfig(HubertOnnxConfig):
     DEFAULT_ONNX_OPSET = 12
 
+    # we need to set output_attentions=True in the model input to avoid calling
+    # torch.nn.functional.scaled_dot_product_attention that is not supported by the ONNX export
+    # due to the op torch.nn.functional.multi_head_attention_forward used for WavLM
+    def patch_model_for_export(self, model: Union["PreTrainedModel", "TFPreTrainedModel"]) -> "ModelPatcher":
+        return WavLMModelPatcher(self, model)
+
 
 class ASTDummyAudioInputGenerator(DummyAudioInputGenerator):
     def generate(self, input_name: str, framework: str = "pt"):
@@ -908,23 +941,6 @@ class WhisperOnnxConfig(AudioToTextOnnxConfig):
     NORMALIZED_CONFIG_CLASS = NormalizedSeq2SeqConfig
     ATOL_FOR_VALIDATION = 1e-3
 
-    def _create_dummy_input_generator_classes(self, **kwargs) -> List["DummyInputGenerator"]:
-        dummy_inputs_generators = super()._create_dummy_input_generator_classes(**kwargs)
-        # The generated encoder_hidden_states for Whisper has dimensions
-        # (batch_size, encoder_sequence_length / 2, hidden_size). Therefore,
-        # the sequence length is updated to generate the proper cross attention
-        # KVS in monolith case.
-        if self._behavior is ConfigBehavior.MONOLITH:
-            dummy_seq2seq_past_key_values_generator = self.DUMMY_INPUT_GENERATOR_CLASSES[2](
-                self.task,
-                self._normalized_config,
-                encoder_sequence_length=dummy_inputs_generators[0].nb_max_frames // 2,
-                **kwargs,
-            )
-            dummy_inputs_generators[2] = dummy_seq2seq_past_key_values_generator
-
-        return dummy_inputs_generators
-
     @property
     def inputs(self) -> Dict[str, Dict[int, str]]:
         common_inputs = super().inputs
@@ -963,20 +979,6 @@ class Speech2TextOnnxConfig(AudioToTextOnnxConfig):
         + (DummyTextInputGenerator,)
     )
     ATOL_FOR_VALIDATION = 1e-4
-
-    def _create_dummy_input_generator_classes(self, **kwargs) -> List["DummyInputGenerator"]:
-        dummy_inputs_generators = super()._create_dummy_input_generator_classes(**kwargs)
-        if self._behavior is ConfigBehavior.MONOLITH:
-            dummy_seq2seq_past_key_values_generator = self.DUMMY_INPUT_GENERATOR_CLASSES[2](
-                self.task,
-                self._normalized_config,
-                encoder_sequence_length=dummy_inputs_generators[0].sequence_length
-                // (2 * self._config.num_conv_layers),
-                **kwargs,
-            )
-            dummy_inputs_generators[2] = dummy_seq2seq_past_key_values_generator
-
-        return dummy_inputs_generators
 
     @property
     def inputs(self) -> Dict[str, Dict[int, str]]:
@@ -1066,7 +1068,6 @@ class VisionEncoderDecoderOnnxConfig(EncoderDecoderOnnxConfig):
 
             if self.use_past_in_inputs:
                 self.add_past_key_values(common_inputs, direction="inputs")
-
         if self._behavior is ConfigBehavior.DECODER:
             common_inputs["encoder_outputs"] = {0: "batch_size", 1: "encoder_sequence_length"}
 
