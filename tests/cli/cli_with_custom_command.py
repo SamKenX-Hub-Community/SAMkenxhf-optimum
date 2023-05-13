@@ -12,28 +12,26 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Utilities related to error handling."""
+
+import os
+
+from optimum.commands import BaseOptimumCLICommand, CommandInfo, ExportCommand
 
 
-class ShapeError(ValueError):
-    pass
+class MyCustomCommand(BaseOptimumCLICommand):
+    COMMAND = CommandInfo(name="blablabla", help="Says something.")
+
+    def run(self):
+        print("If the CI can read this, it means it worked!")
 
 
-class AtolError(ValueError):
-    pass
+parent_command_cls = os.environ.get("TEST_REGISTER_COMMAND_WITH_SUBCOMMAND", None)
 
-
-class OutputMatchError(ValueError):
-    pass
-
-
-class NumberOfInputsMatchError(ValueError):
-    pass
-
-
-class NumberOfOutputsMatchError(ValueError):
-    pass
-
-
-class MinimumVersionError(ValueError):
-    pass
+if parent_command_cls == "true":
+    REGISTER_COMMANDS = [
+        (MyCustomCommand, ExportCommand),
+    ]
+else:
+    REGISTER_COMMANDS = [
+        MyCustomCommand,
+    ]

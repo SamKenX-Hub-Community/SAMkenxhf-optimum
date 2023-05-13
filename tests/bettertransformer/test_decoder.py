@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import gc
 import unittest
 
 import pytest
@@ -22,21 +23,24 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from optimum.bettertransformer import BetterTransformer
 from optimum.utils import DummyPastKeyValuesGenerator, NormalizedConfigManager
-from optimum.utils.testing_utils import grid_parameters, require_torch_20, require_torch_gpu
+from optimum.utils.testing_utils import grid_parameters, require_accelerate, require_torch_20, require_torch_gpu
 
 
 class BetterTransformersDecoderTest(BetterTransformersTestMixin, unittest.TestCase):
-    SUPPORTED_ARCH = ["codegen", "gpt2", "gptj", "gpt_neo", "gpt_neox", "opt"]
+    SUPPORTED_ARCH = ["codegen", "gpt2", "gptj", "gpt_neo", "gpt_neox", "llama", "opt"]
 
     FULL_GRID = {
         "model_type": SUPPORTED_ARCH,
         "keep_original_model": [True, False],
     }
 
-    def prepare_inputs_for_class(self, model_id, model_type, batch_size=2, **preprocessor_kwargs):
+    def prepare_inputs_for_class(self, model_id: str, model_type: str, batch_size: int = 2, **preprocessor_kwargs):
         tokenizer = AutoTokenizer.from_pretrained(model_id)
         if not hasattr(tokenizer, "pad_token") or tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+            if tokenizer.eos_token != "":
+                tokenizer.pad_token = tokenizer.eos_token
+            else:
+                tokenizer.pad_token = "w"
 
         padding = preprocessor_kwargs.pop("padding", True)
         if batch_size == 1:
@@ -44,6 +48,10 @@ class BetterTransformersDecoderTest(BetterTransformersTestMixin, unittest.TestCa
         else:
             texts = ["a dummy input yeah!"] + ["and two"] * (batch_size - 1)
         inputs = tokenizer(texts, return_tensors="pt", padding=padding, max_length=20, **preprocessor_kwargs)
+
+        if model_type == "llama":
+            del inputs["token_type_ids"]
+
         return inputs
 
     @parameterized.expand(
@@ -68,18 +76,23 @@ class BetterTransformersDecoderTest(BetterTransformersTestMixin, unittest.TestCa
             {
                 "model_type": SUPPORTED_ARCH,
                 "use_to_operator": [True, False],
+                "batch_size": [1, 2],
             }
         )
     )
     @pytest.mark.fp16
     @require_torch_gpu
     @pytest.mark.gpu_test
-    def test_fp16_inference(self, test_name: str, model_type: str, use_to_operator: bool):
+    def test_fp16_inference(self, test_name: str, model_type: str, use_to_operator: bool, batch_size: int):
         self._skip_on_torch_version(model_type)
 
         model_id = MODELS_DICT[model_type]
         self._test_fp16_inference(
-            model_id, model_type=model_type, use_to_operator=use_to_operator, automodel_class=AutoModelForCausalLM
+            model_id,
+            model_type=model_type,
+            use_to_operator=use_to_operator,
+            automodel_class=AutoModelForCausalLM,
+            batch_size=batch_size,
         )
 
     @parameterized.expand(
@@ -135,12 +148,18 @@ class BetterTransformersDecoderTest(BetterTransformersTestMixin, unittest.TestCa
         model = AutoModelForCausalLM.from_pretrained(model_id)
 
         if not hasattr(tokenizer, "pad_token") or tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+            if tokenizer.eos_token != "":
+                tokenizer.pad_token = tokenizer.eos_token
+            else:
+                tokenizer.pad_token = "w"
 
         text = ["This is me and me"]
         if batch_size > 1:
             text.append("Please continue this my dear me")
         inp = tokenizer(text, return_tensors="pt", padding=padding, max_length=30)
+
+        if model_type == "llama":
+            del inp["token_type_ids"]
 
         length = 50
         result_vanilla = model.generate(**inp, num_beams=1, min_length=length, max_length=length)
@@ -188,3 +207,40 @@ class BetterTransformersDecoderTest(BetterTransformersTestMixin, unittest.TestCa
         self._test_invert_model_logits(
             model_id=model_id, model_type=model_type, keep_original_model=keep_original_model
         )
+
+    @parameterized.expand(
+        grid_parameters(
+            {"keep_original_model": [True], "max_memory": [{0: "300MB", "cpu": "3GB"}, {0: "2GB"}]},
+            add_test_name=False,
+        )
+    )
+    @require_torch_gpu
+    @require_accelerate
+    def test_accelerate_compatibility_cpu_gpu(self, keep_original_model=True, max_memory=None):
+        hf_model = AutoModelForCausalLM.from_pretrained("gpt2", device_map="auto", max_memory=max_memory).eval()
+        bt_model = BetterTransformer.transform(
+            hf_model, keep_original_model=keep_original_model, max_memory=max_memory
+        )
+
+        inputs_ids = torch.LongTensor([[1, 1, 1, 1, 1, 1], [1, 1, 1, 1, 1, 1]])
+        attention_mask = torch.Tensor([[1, 1, 1, 1, 1, 1], [1, 1, 1, 0, 0, 0]])
+
+        # Check that the model has been dispatched on CPU and GPU
+        self.assertSetEqual(set(hf_model.hf_device_map.values()), set(max_memory))
+        self.assertSetEqual(set(bt_model.hf_device_map.values()), set(max_memory))
+
+        # Check that the model has weights on GPU and CPU
+        self.assertEqual(bt_model.transformer.h[0].mlp.c_fc.weight.device, torch.device("cuda:0"))
+
+        # Weights that are offloaded on the CPU are offloaded on the `meta` device
+        if "cpu" in set(max_memory):
+            self.assertEqual(bt_model.transformer.h[-1].mlp.c_fc.weight.device, torch.device("meta"))
+
+        with torch.inference_mode():
+            output_bt = bt_model(inputs_ids, attention_mask=attention_mask)
+            output_hf = hf_model(inputs_ids, attention_mask=attention_mask)
+
+        self.assertEqual(output_bt[0].device, torch.device("cpu"))
+        self.assertTrue(torch.allclose(output_bt[0], output_hf[0], atol=1e-3))
+
+        gc.collect()

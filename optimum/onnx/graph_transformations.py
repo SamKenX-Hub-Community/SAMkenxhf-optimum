@@ -36,9 +36,6 @@ from .transformations_utils import (
 logger = logging.get_logger()
 
 
-ONNX_BYTE_SIZE_LIMIT = 2147483648
-
-
 def remove_duplicate_weights(model: ModelProto, inplace: bool = False) -> ModelProto:
     """
     Finds and removes duplicate weights in a model by keeping only unique weights, and make the duplicate values point
@@ -98,6 +95,7 @@ def merge_decoders(
     graph_name: str = "merged",
     producer_name: str = "optimum-onnx",
     save_path: Optional[Union[str, Path]] = None,
+    strict: bool = True,
 ) -> ModelProto:
     """
     Fuses decoder ONNX model and decoder with past ONNX model into one ONNX model with if logic.
@@ -113,6 +111,10 @@ def merge_decoders(
             Graph producer name.
         save_path (`Optional[Union[str, Path]]`, defaults to `None`):
             The path to save merged ONNX model. The model will be saved if the path is given.
+        strict (`bool`, defaults to `True`):
+            When set, the decoder and decoder_with_past are expected to have strictly the same number of outputs. When False,
+            the decoder is allowed to have more outputs that decoder_with_past, in which case constant outputs are added to match
+            the number of outputs.
 
     Returns:
         `~onnx.ModelProto`: The fused decoder ONNX model.
@@ -132,7 +134,7 @@ def merge_decoders(
             f"Decoder's opset is {decoder_opset}, but decoder with past's opset is {decoder_with_past_opset}. Make sure having the same opset before merging."
         )
 
-    _unify_onnx_outputs(decoder, decoder_with_past)
+    _unify_onnx_outputs(decoder, decoder_with_past, strict=strict)
     all_inputs = _get_all_inputs([decoder, decoder_with_past])
 
     # Replace the axis name `sequence_length` of the attention_mask input by `attention_mask_sequence_length`.
@@ -209,7 +211,7 @@ def merge_decoders(
 
     # for large models, a path must be provided instead of a ModelProto:
     # https://github.com/onnx/onnx/blob/main/docs/PythonAPIOverview.md#checking-a-large-onnx-model-2gb
-    if merged_model.ByteSize() < ONNX_BYTE_SIZE_LIMIT:
+    if merged_model.ByteSize() < onnx.checker.MAXIMUM_PROTOBUF:
         # For the try catch, refer to https://github.com/microsoft/onnxruntime/issues/14768
         try:
             onnx.checker.check_model(merged_model)

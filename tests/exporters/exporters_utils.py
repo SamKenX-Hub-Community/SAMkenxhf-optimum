@@ -15,9 +15,11 @@
 
 VALIDATE_EXPORT_ON_SHAPES_SLOW = {
     "batch_size": [1, 3, 5],
-    "sequence_length": [8, 19, 33, 64, 96, 154],
+    "sequence_length": [8, 33, 96, 154],
     "num_choices": [2, 4],
     "audio_sequence_length": [1000, 2000],
+    "point_batch_size": [1, 5],
+    "nb_points_per_image": [1, 3],
 }
 
 VALIDATE_EXPORT_ON_SHAPES_FAST = {
@@ -63,7 +65,8 @@ PYTORCH_EXPORT_MODELS_TINY = {
     "levit": "hf-internal-testing/tiny-random-LevitModel",
     "layoutlm": "hf-internal-testing/tiny-random-LayoutLMModel",
     "layoutlmv3": "hf-internal-testing/tiny-random-LayoutLMv3Model",
-    "longt5": "hf-internal-testing/tiny-random-LongT5Model",
+    "llama": "fxmarty/tiny-llama-fast-tokenizer",
+    "longt5": "fxmarty/tiny-random-working-LongT5Model",
     # "longformer": "allenai/longformer-base-4096",
     "m2m-100": "hf-internal-testing/tiny-random-m2m_100",
     "marian": "sshleifer/tiny-marian-en-de",  # hf-internal-testing ones are broken
@@ -79,7 +82,7 @@ PYTORCH_EXPORT_MODELS_TINY = {
     # "owlvit": "google/owlvit-base-patch32",
     "pegasus": "hf-internal-testing/tiny-random-PegasusModel",
     "perceiver": {
-        "hf-internal-testing/tiny-random-language_perceiver": ["masked-lm", "sequence-classification"],
+        "hf-internal-testing/tiny-random-language_perceiver": ["fill-mask", "text-classification"],
         "hf-internal-testing/tiny-random-vision_perceiver_conv": ["image-classification"],
     },
     # "rembert": "google/rembert",
@@ -88,6 +91,7 @@ PYTORCH_EXPORT_MODELS_TINY = {
     "resnet": "hf-internal-testing/tiny-random-resnet",
     "roberta": "hf-internal-testing/tiny-random-RobertaModel",
     "roformer": "hf-internal-testing/tiny-random-RoFormerModel",
+    "sam": "fxmarty/sam-vit-tiny-random",
     "segformer": "hf-internal-testing/tiny-random-SegformerModel",
     "splinter": "hf-internal-testing/tiny-random-SplinterModel",
     "squeezebert": "hf-internal-testing/tiny-random-SqueezeBertModel",
@@ -100,7 +104,11 @@ PYTORCH_EXPORT_MODELS_TINY = {
     "wav2vec2": "hf-internal-testing/tiny-random-Wav2Vec2Model",
     "wav2vec2-conformer": "hf-internal-testing/tiny-random-wav2vec2-conformer",
     "wavlm": {
-        "hf-internal-testing/tiny-random-wavlm": ["default", "audio-ctc", "audio-classification"],
+        "hf-internal-testing/tiny-random-wavlm": [
+            "feature-extraction",
+            "automatic-speech-recognition",
+            "audio-classification",
+        ],
         "hf-internal-testing/tiny-random-WavLMForCTC": ["audio-frame-classification"],
         "hf-internal-testing/tiny-random-WavLMForXVector": ["audio-xvector"],
     },
@@ -108,7 +116,11 @@ PYTORCH_EXPORT_MODELS_TINY = {
     "sew-d": "hf-internal-testing/tiny-random-SEWDModel",
     "unispeech": "hf-internal-testing/tiny-random-unispeech",
     "unispeech-sat": {
-        "hf-internal-testing/tiny-random-unispeech-sat": ["default", "audio-ctc", "audio-classification"],
+        "hf-internal-testing/tiny-random-unispeech-sat": [
+            "feature-extraction",
+            "automatic-speech-recognition",
+            "audio-classification",
+        ],
         "hf-internal-testing/tiny-random-UniSpeechSatForPreTraining": ["audio-frame-classification"],
         "hf-internal-testing/tiny-random-UniSpeechSatForXVector": ["audio-xvector"],
     },
@@ -120,10 +132,10 @@ PYTORCH_EXPORT_MODELS_TINY = {
     "xlm-roberta": "hf-internal-testing/tiny-xlm-roberta",
     "vision-encoder-decoder": {
         "hf-internal-testing/tiny-random-VisionEncoderDecoderModel-vit-gpt2": [
-            "vision2seq-lm",
-            "vision2seq-lm-with-past",
+            "image-to-text",
+            "image-to-text-with-past",
         ],
-        "microsoft/trocr-small-handwritten": ["vision2seq-lm"],
+        "microsoft/trocr-small-handwritten": ["image-to-text"],
     },
 }
 
@@ -163,7 +175,8 @@ PYTORCH_EXPORT_MODELS_LARGE = {
     "levit": "facebook/levit-128S",
     "layoutlm": "microsoft/layoutlm-base-uncased",
     "layoutlmv3": "microsoft/layoutlmv3-base",
-    "longt5": "hf-internal-testing/tiny-random-longt5",  # Not using google/long-t5-local-base because it takes too much time for testing.
+    "llama": "decapoda-research/llama-65b-hf",
+    "longt5": "fxmarty/tiny-random-working-LongT5Model",  # Not using google/long-t5-local-base because it takes too much time for testing.
     # "longformer": "allenai/longformer-base-4096",
     "m2m-100": "hf-internal-testing/tiny-random-m2m_100",  # Not using facebook/m2m100_418M because it takes too much time for testing.
     "marian": "Helsinki-NLP/opus-mt-en-de",
@@ -182,6 +195,7 @@ PYTORCH_EXPORT_MODELS_LARGE = {
     "resnet": "microsoft/resnet-50",
     "roberta": "roberta-base",
     "roformer": "junnyu/roformer_chinese_base",
+    "sam": "facebook/sam-vit-base",
     "segformer": "nvidia/segformer-b0-finetuned-ade-512-512",
     "splinter": "hf-internal-testing/tiny-random-SplinterModel",
     "squeezebert": "squeezebert/squeezebert-uncased",

@@ -252,6 +252,12 @@ class ORTModel(OptimizedModel):
     ):
         super().__init__(model, config)
 
+        if use_io_binding is None:
+            if model.get_providers()[0] == "CUDAExecutionProvider":
+                use_io_binding = True
+            else:
+                use_io_binding = False
+
         self.model_path = Path(model._model_path)
         self.model_name = self.model_path.name
 
@@ -783,6 +789,7 @@ class ORTModel(OptimizedModel):
                 for axis_name in output_node.shape:
                     output_shape.append(self._output_shape_inference(axis_name, dimensions))
             output_buffer = self._prepare_output_buffer(model, output_shape, output_name)
+
             io_binding.bind_output(
                 output_name,
                 output_buffer.device.type,
@@ -881,6 +888,9 @@ class ORTModelForFeatureExtraction(ORTModel):
         self.raise_on_numpy_input_io_binding(use_torch)
 
         if self.device.type == "cuda" and self.use_io_binding:
+            if attention_mask is None:
+                attention_mask = torch.ones_like(input_ids)
+
             io_binding, output_shapes, output_buffers = self.prepare_io_binding(
                 input_ids,
                 attention_mask,
@@ -900,7 +910,10 @@ class ORTModelForFeatureExtraction(ORTModel):
         else:
             if use_torch:
                 input_ids = input_ids.cpu().detach().numpy()
-                attention_mask = attention_mask.cpu().detach().numpy()
+                if attention_mask is None:
+                    attention_mask = np.ones_like(input_ids)
+                else:
+                    attention_mask = attention_mask.cpu().detach().numpy()
                 if token_type_ids is not None:
                     token_type_ids = token_type_ids.cpu().detach().numpy()
 
@@ -974,7 +987,7 @@ class ORTModelForMaskedLM(ORTModel):
         + MASKED_LM_EXAMPLE.format(
             processor_class=_TOKENIZER_FOR_DOC,
             model_class="ORTModelForMaskedLM",
-            checkpoint="optimum/bert-base-uncased-for-masked-lm",
+            checkpoint="optimum/bert-base-uncased-for-fill-mask",
         )
     )
     def forward(

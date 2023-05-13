@@ -13,12 +13,20 @@
 # limitations under the License.
 import warnings
 
+from .attention import _llama_prepare_decoder_attention_mask
 from .decoder_models import (
     BartAttentionLayerBetterTransformer,
+    BlenderbotAttentionLayerBetterTransformer,
     CodegenAttentionLayerBetterTransformer,
     GPT2AttentionLayerBetterTransformer,
+    GPTJAttentionLayerBetterTransformer,
     GPTNeoAttentionLayerBetterTransformer,
+    GPTNeoXAttentionLayerBetterTransformer,
+    LlamaAttentionLayerBetterTransformer,
+    M2M100AttentionLayerBetterTransformer,
+    MarianAttentionLayerBetterTransformer,
     OPTAttentionLayerBetterTransformer,
+    PegasusAttentionLayerBetterTransformer,
     T5AttentionLayerBetterTransformer,
 )
 from .encoder_models import (
@@ -29,6 +37,7 @@ from .encoder_models import (
     DistilBertLayerBetterTransformer,
     FSMTEncoderLayerBetterTransformer,
     MBartEncoderLayerBetterTransformer,
+    ProphetNetEncoderLayerBetterTransformer,
     ViltLayerBetterTransformer,
     ViTLayerBetterTransformer,
     Wav2Vec2EncoderLayerBetterTransformer,
@@ -45,7 +54,7 @@ class BetterTransformerManager:
         },
         "bert": {"BertLayer": BertLayerBetterTransformer},
         "bert-generation": {"BertGenerationLayer": BertLayerBetterTransformer},
-        "blenderbot": {"BlenderbotAttention": BartAttentionLayerBetterTransformer},
+        "blenderbot": {"BlenderbotAttention": BlenderbotAttentionLayerBetterTransformer},
         "camembert": {"CamembertLayer": BertLayerBetterTransformer},
         "clip": {"CLIPEncoderLayer": CLIPLayerBetterTransformer},
         "codegen": {"CodeGenAttention": CodegenAttentionLayerBetterTransformer},
@@ -56,24 +65,26 @@ class BetterTransformerManager:
         "ernie": {"ErnieLayer": BertLayerBetterTransformer},
         "fsmt": {"EncoderLayer": FSMTEncoderLayerBetterTransformer},
         "gpt2": {"GPT2Attention": GPT2AttentionLayerBetterTransformer},
-        "gptj": {"GPTJAttention": GPT2AttentionLayerBetterTransformer},
+        "gptj": {"GPTJAttention": GPTJAttentionLayerBetterTransformer},
         "gpt_neo": {"GPTNeoSelfAttention": GPTNeoAttentionLayerBetterTransformer},
-        "gpt_neox": {"GPTNeoXAttention": GPT2AttentionLayerBetterTransformer},
+        "gpt_neox": {"GPTNeoXAttention": GPTNeoXAttentionLayerBetterTransformer},
         "hubert": {"HubertEncoderLayer": Wav2Vec2EncoderLayerBetterTransformer},
         "layoutlm": {"LayoutLMLayer": BertLayerBetterTransformer},
+        "llama": {"LlamaAttention": LlamaAttentionLayerBetterTransformer},
         "m2m_100": {
             "M2M100EncoderLayer": MBartEncoderLayerBetterTransformer,
-            "M2M100Attention": BartAttentionLayerBetterTransformer,
+            "M2M100Attention": M2M100AttentionLayerBetterTransformer,
         },
         "marian": {
             "MarianEncoderLayer": BartEncoderLayerBetterTransformer,
-            "MarianAttention": BartAttentionLayerBetterTransformer,
+            "MarianAttention": MarianAttentionLayerBetterTransformer,
         },
         "markuplm": {"MarkupLMLayer": BertLayerBetterTransformer},
         "mbart": {"MBartEncoderLayer": MBartEncoderLayerBetterTransformer},
         "opt": {"OPTAttention": OPTAttentionLayerBetterTransformer},
-        "pegasus": {"PegasusAttention": BartAttentionLayerBetterTransformer},
+        "pegasus": {"PegasusAttention": PegasusAttentionLayerBetterTransformer},
         "rembert": {"RemBertLayer": BertLayerBetterTransformer},
+        "prophetnet": {"ProphetNetEncoderLayer": ProphetNetEncoderLayerBetterTransformer},
         "roberta": {"RobertaLayer": BertLayerBetterTransformer},
         "roc_bert": {"RoCBertLayer": BertLayerBetterTransformer},
         "roformer": {"RoFormerLayer": BertLayerBetterTransformer},
@@ -91,6 +102,10 @@ class BetterTransformerManager:
         "whisper": {"WhisperEncoderLayer": WhisperEncoderLayerBetterTransformer},
         "xlm-roberta": {"XLMRobertaLayer": BertLayerBetterTransformer},
         "yolos": {"YolosLayer": ViTLayerBetterTransformer},
+    }
+
+    OVERWRITE_METHODS = {
+        "llama": {"LlamaModel": ("_prepare_decoder_attention_mask", _llama_prepare_decoder_attention_mask)}
     }
 
     EXCLUDE_FROM_TRANSFORM = {
@@ -125,6 +140,7 @@ class BetterTransformerManager:
         """
         return model_type in BetterTransformerManager.MODEL_MAPPING
 
+    # TODO: the following methods are almost duplicate, it is frankly quite ugly
     @staticmethod
     def requires_nested_tensor(model_type: str) -> bool:
         """
@@ -134,7 +150,18 @@ class BetterTransformerManager:
             model_type (`str`):
                 The model type to check.
         """
-        if model_type in ["blenderbot", "codegen", "gpt2", "gptj", "gpt_neo", "gpt_neox", "opt", "pegasus", "t5"]:
+        if model_type in [
+            "blenderbot",
+            "codegen",
+            "gpt2",
+            "gptj",
+            "gpt_neo",
+            "gpt_neox",
+            "llama",
+            "opt",
+            "pegasus",
+            "t5",
+        ]:
             return False
         else:
             return True
@@ -148,7 +175,18 @@ class BetterTransformerManager:
             model_type (`str`):
                 The model type to check.
         """
-        if model_type in ["blenderbot", "codegen", "gpt2", "gptj", "gpt_neo", "gpt_neox", "opt", "pegasus", "t5"]:
+        if model_type in [
+            "blenderbot",
+            "codegen",
+            "gpt2",
+            "gptj",
+            "gpt_neo",
+            "gpt_neox",
+            "llama",
+            "opt",
+            "pegasus",
+            "t5",
+        ]:
             return False
         else:
             return True
@@ -170,6 +208,7 @@ class BetterTransformerManager:
             "gptj",
             "gpt_neo",
             "gpt_neox",
+            "llama",
             "m2m_100",
             "marian",
             "mbart",
