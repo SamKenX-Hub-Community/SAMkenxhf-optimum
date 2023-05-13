@@ -28,6 +28,7 @@ from onnxruntime import InferenceSession
 from parameterized import parameterized
 from transformers import AutoModel, AutoTokenizer
 
+from optimum.exporters.onnx import main_export
 from optimum.onnx.graph_transformations import (
     cast_slice_nodes_inputs_to_int32,
     merge_decoders,
@@ -42,7 +43,7 @@ class WeightSharingTestCase(TestCase):
                 tokenizer = AutoTokenizer.from_pretrained(model_id)
                 model = AutoModel.from_pretrained(model_id)
 
-                task = "default"
+                task = "feature-extraction"
                 with TemporaryDirectory() as tmpdir:
                     subprocess.run(
                         f"python3 -m optimum.exporters.onnx --model {model_id} --task {task} {tmpdir}",
@@ -68,7 +69,10 @@ class WeightSharingTestCase(TestCase):
 
 class OnnxMergingTestCase(TestCase):
     SUPPORTED_ARCHITECTURES_WITH_MODEL_ID = {
-        "hf-internal-testing/tiny-random-GPT2Model": "causal-lm-with-past",
+        "hf-internal-testing/tiny-random-GPT2Model": "text-generation-with-past",
+        "hf-internal-testing/tiny-random-t5": "text2text-generation-with-past",
+        "hf-internal-testing/tiny-random-bart": "text2text-generation-with-past",
+        "openai/whisper-tiny.en": "automatic-speech-recognition-with-past",
     }
 
     @parameterized.expand(SUPPORTED_ARCHITECTURES_WITH_MODEL_ID.items())
@@ -76,24 +80,21 @@ class OnnxMergingTestCase(TestCase):
         model_id, task = args
 
         with TemporaryDirectory() as tmpdir:
-            subprocess.run(
-                f"python3 -m optimum.exporters.onnx --model {model_id} --task {task} {tmpdir} --no-post-process",
-                shell=True,
-                check=True,
+            main_export(
+                model_id,
+                tmpdir,
+                task=task,
+                no_post_process=True,
             )
 
             decoder = onnx.load(os.path.join(tmpdir, "decoder_model.onnx"))
             decoder_with_past = onnx.load(os.path.join(tmpdir, "decoder_with_past_model.onnx"))
+            merged_path = os.path.join(tmpdir, "decoder_model_merged.onnx")
 
-            merge_decoders(
-                decoder,
-                decoder_with_past,
-                save_path=os.path.join(tmpdir, "decoder_model_merged.onnx"),
-            )
+            merge_decoders(decoder, decoder_with_past, save_path=merged_path, strict=False)
 
-
-if __name__ == "__main__":
-    unittest.main()
+            # ONNX Runtime does additional validity checks compared to onnx.checker.check_model
+            InferenceSession(merged_path, providers=["CPUExecutionProvider"])
 
 
 class OnnxToInt32Test(TestCase):
@@ -127,3 +128,7 @@ class OnnxToInt32Test(TestCase):
             }
 
             model.run(None, inputs)
+
+
+if __name__ == "__main__":
+    unittest.main()

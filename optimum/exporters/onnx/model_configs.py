@@ -24,6 +24,7 @@ from ...utils import (
     DummyAudioInputGenerator,
     DummyDecoderTextInputGenerator,
     DummyPastKeyValuesGenerator,
+    DummyPointsGenerator,
     DummySeq2SeqDecoderTextInputGenerator,
     DummySeq2SeqPastKeyValuesGenerator,
     DummyTextInputGenerator,
@@ -208,6 +209,11 @@ class OPTOnnxConfig(TextDecoderOnnxConfig):
     NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
 
 
+class LlamaOnnxConfig(TextDecoderOnnxConfig):
+    DEFAULT_ONNX_OPSET = 13
+    NORMALIZED_CONFIG_CLASS = NormalizedTextConfig
+
+
 class BloomDummyPastKeyValuesGenerator(DummyPastKeyValuesGenerator):
     def generate(self, input_name: str, framework: str = "pt"):
         past_key_shape = (
@@ -291,6 +297,7 @@ class T5OnnxConfig(TextSeq2SeqOnnxConfig):
     DUMMY_INPUT_GENERATOR_CLASSES = TextSeq2SeqOnnxConfig.DUMMY_INPUT_GENERATOR_CLASSES[:-1] + (
         T5DummySeq2SeqPastKeyValuesGenerator,
     )
+    DUMMY_PKV_GENERATOR_CLASS = T5DummySeq2SeqPastKeyValuesGenerator
     NORMALIZED_CONFIG_CLASS = NormalizedSeq2SeqConfig.with_args(
         hidden_size="d_model",
         num_attention_heads="num_heads",
@@ -299,6 +306,16 @@ class T5OnnxConfig(TextSeq2SeqOnnxConfig):
         key_value_dim="d_kv",
         allow_new=True,
     )
+
+    def generate_dummy_inputs_for_validation(self, reference_model_inputs: Dict[str, Any]) -> Dict[str, Any]:
+        if self._behavior is ConfigBehavior.DECODER:
+            reference_model_inputs["input_ids"] = reference_model_inputs.pop("decoder_input_ids")
+
+            # T5 requires encoder_hidden_states as an input for both the without/with past models,
+            # which is different than other architectures that require it only for the without past case
+            reference_model_inputs["encoder_hidden_states"] = reference_model_inputs.pop("encoder_outputs")[0]
+
+        return super().generate_dummy_inputs_for_validation(reference_model_inputs)
 
 
 class MT5OnnxConfig(T5OnnxConfig):
@@ -339,7 +356,7 @@ class BartDummyTextInputGenerator(DummyTextInputGenerator):
     def generate(self, input_name: str, framework: str = "pt"):
         int_tensor = super().generate(input_name, framework=framework)
         # This inserts EOS_TOKEN_ID at random locations along the sequence length dimension.
-        if self.force_eos_token_id_presence and "input_ids" in input_name and self.task == "sequence-classification":
+        if self.force_eos_token_id_presence and "input_ids" in input_name and self.task == "text-classification":
             for idx in range(self.batch_size):
                 if self.eos_token_id in int_tensor[idx]:
                     continue
@@ -353,7 +370,7 @@ class BartOnnxConfig(TextSeq2SeqOnnxConfig):
     NORMALIZED_CONFIG_CLASS = NormalizedSeq2SeqConfig.with_args(
         encoder_num_layers="encoder_layers",
         decoder_num_layers="decoder_layers",
-        num_layers="decoder_layers",  # Used for the causal-lm task past key values input generation.
+        num_layers="decoder_layers",  # Used for the text-generation task past key values input generation.
         encoder_num_attention_heads="encoder_attention_heads",
         decoder_num_attention_heads="decoder_attention_heads",
         eos_token_id="eos_token_id",
@@ -361,12 +378,12 @@ class BartOnnxConfig(TextSeq2SeqOnnxConfig):
     DUMMY_INPUT_GENERATOR_CLASSES = (
         BartDummyTextInputGenerator,
         {
-            "default": DummySeq2SeqDecoderTextInputGenerator,
-            "causal-lm": DummyDecoderTextInputGenerator,
+            "feature-extraction": DummySeq2SeqDecoderTextInputGenerator,
+            "text-generation": DummyDecoderTextInputGenerator,
         },
         {
-            "default": DummySeq2SeqPastKeyValuesGenerator,
-            "causal-lm": DummyPastKeyValuesGenerator,
+            "feature-extraction": DummySeq2SeqPastKeyValuesGenerator,
+            "text-generation": DummyPastKeyValuesGenerator,
         },
     )
 
@@ -374,11 +391,11 @@ class BartOnnxConfig(TextSeq2SeqOnnxConfig):
         dummy_text_input_generator = self.DUMMY_INPUT_GENERATOR_CLASSES[0](
             self.task, self._normalized_config, **kwargs
         )
-        task = "default" if self.task != "causal-lm" else "causal-lm"
+        task = "feature-extraction" if self.task != "text-generation" else "text-generation"
         dummy_decoder_text_input_generator = self.DUMMY_INPUT_GENERATOR_CLASSES[1][task](
             self.task, self._normalized_config, **kwargs
         )
-        if self.task != "causal-lm":
+        if self.task != "text-generation":
             kwargs["encoder_sequence_length"] = dummy_text_input_generator.sequence_length
 
         dummy_seq2seq_past_key_values_generator = self.DUMMY_INPUT_GENERATOR_CLASSES[2][task](
@@ -430,21 +447,19 @@ class BartOnnxConfig(TextSeq2SeqOnnxConfig):
     @property
     def inputs(self) -> Dict[str, Dict[int, str]]:
         inputs_properties = {
-            "default": self.inputs_for_default_and_seq2seq_lm,
-            "seq2seq-lm": self.inputs_for_default_and_seq2seq_lm,
-            "causal-lm": self.inputs_for_causal_lm,
+            "feature-extraction": self.inputs_for_default_and_seq2seq_lm,
+            "text2text-generation": self.inputs_for_default_and_seq2seq_lm,
+            "text-generation": self.inputs_for_causal_lm,
             "other": self.inputs_for_other_tasks,
         }
         return inputs_properties.get(self.task, inputs_properties["other"])
 
     @property
     def outputs(self) -> Dict[str, Dict[int, str]]:
-        if self.task in ["default", "seq2seq-lm"]:
+        if self.task in ["feature-extraction", "text2text-generation"]:
             common_outputs = super().outputs
         else:
             common_outputs = super(OnnxConfigWithPast, self).outputs
-            if self.task != "causal-lm":
-                common_outputs["encoder_last_hidden_state"] = {0: "batch_size", 1: "sequence_length"}
             if self.use_present_in_outputs:
                 for i in range(self._normalized_config.encoder_num_layers):
                     common_outputs[f"present.{i}.key"] = {0: "batch_size", 2: "past_sequence_length + sequence_length"}
@@ -455,8 +470,8 @@ class BartOnnxConfig(TextSeq2SeqOnnxConfig):
         return common_outputs
 
     def generate_dummy_inputs(self, framework: str = "pt", **kwargs):
-        # This will handle the attention mask padding when Bart is used for causal-lm.
-        if self.task == "causal-lm":
+        # This will handle the attention mask padding when Bart is used for text-generation.
+        if self.task == "text-generation":
             self.PAD_ATTENTION_MASK_TO_PAST = True
 
         dummy_inputs = super().generate_dummy_inputs(framework=framework, **kwargs)
@@ -466,7 +481,7 @@ class BartOnnxConfig(TextSeq2SeqOnnxConfig):
         return dummy_inputs
 
     def flatten_past_key_values(self, flattened_output, name, idx, t):
-        if self.task in ["default", "seq2seq-lm"]:
+        if self.task in ["feature-extraction", "text2text-generation"]:
             flattened_output = super().flatten_past_key_values(flattened_output, name, idx, t)
         else:
             flattened_output = super(OnnxSeq2SeqConfigWithPast, self).flatten_past_key_values(
@@ -786,7 +801,7 @@ class LayoutLMv3OnnxConfig(TextAndVisionOnnxConfig):
 
     @property
     def inputs(self) -> Dict[str, Dict[int, str]]:
-        if self.task in ["sequence-classification", "question-answering"]:
+        if self.task in ["text-classification", "question-answering"]:
             pixel_values_dynamic_axes = {0: "batch_size", 1: "num_channels", 2: "height", 3: "width"}
         else:
             pixel_values_dynamic_axes = {0: "batch_size", 1: "num_channels"}
@@ -825,14 +840,14 @@ class PerceiverOnnxConfig(TextAndVisionOnnxConfig):
         PerceiverDummyInputGenerator,
     ) + TextAndVisionOnnxConfig.DUMMY_INPUT_GENERATOR_CLASSES
 
-    def __init__(self, config: "PretrainedConfig", task: str = "default"):
+    def __init__(self, config: "PretrainedConfig", task: str = "feature-extraction"):
         super().__init__(config, task=task)
         self.is_generating_dummy_inputs = False
 
     @property
     def inputs_name(self):
         if self.is_generating_dummy_inputs:
-            if self.task in ["masked-lm", "sequence-classification"]:
+            if self.task in ["fill-mask", "text-classification"]:
                 return "input_ids"
             else:
                 return "pixel_values"
@@ -944,7 +959,7 @@ class WhisperOnnxConfig(AudioToTextOnnxConfig):
     @property
     def inputs(self) -> Dict[str, Dict[int, str]]:
         common_inputs = super().inputs
-        if self._behavior is ConfigBehavior.DECODER:
+        if self._behavior is ConfigBehavior.DECODER and self.use_past_in_inputs is False:
             common_inputs["encoder_outputs"][1] = f"{common_inputs['encoder_outputs'][1]} / 2"
         return common_inputs
 
@@ -1038,7 +1053,7 @@ class VisionEncoderDecoderOnnxConfig(EncoderDecoderOnnxConfig):
     def __init__(
         self,
         config: "PretrainedConfig",
-        task: str = "default",
+        task: str = "feature-extraction",
         use_past: bool = False,
         use_past_in_inputs: Optional[bool] = None,
         use_present_in_outputs: Optional[bool] = None,
@@ -1072,3 +1087,32 @@ class VisionEncoderDecoderOnnxConfig(EncoderDecoderOnnxConfig):
             common_inputs["encoder_outputs"] = {0: "batch_size", 1: "encoder_sequence_length"}
 
         return common_inputs
+
+
+class SamOnnxConfig(OnnxConfig):
+    MIN_TRANSFORMERS_VERSION = version.parse("4.29.0.dev0")
+    NORMALIZED_CONFIG_CLASS = NormalizedEncoderDecoderConfig
+    DUMMY_INPUT_GENERATOR_CLASSES = (DummyVisionInputGenerator, DummyPointsGenerator)
+    DEFAULT_ONNX_OPSET = 12  # einsum op not supported with opset 11
+
+    def __init__(self, config: "PretrainedConfig", task: str = "feature-extraction"):
+        super().__init__(config, task)
+        self._normalized_config.ENCODER_NORMALIZED_CONFIG_CLASS = NormalizedVisionConfig(self._config.vision_config)
+
+    @property
+    def inputs(self) -> Dict[str, Dict[int, str]]:
+        inputs = {
+            "pixel_values": {0: "batch_size"},
+            "input_points": {0: "batch_size", 1: "point_batch_size", 2: "nb_points_per_image"},
+        }
+
+        return inputs
+
+    @property
+    def outputs(self) -> Dict[str, Dict[int, str]]:
+        outputs = {
+            "iou_scores": {0: "batch_size", 1: "point_batch_size"},
+            "pred_masks": {0: "batch_size", 1: "point_batch_size"},
+        }
+
+        return outputs

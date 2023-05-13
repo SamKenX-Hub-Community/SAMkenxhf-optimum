@@ -114,6 +114,7 @@ class ORTConfigManager:
         "gptj": "gpt2",
         # longt5 with O4 results in segmentation fault
         "longt5": "bert",
+        "llama": "gpt2",
         "marian": "bart",
         "mbart": "bart",
         "mt5": "bart",
@@ -122,6 +123,7 @@ class ORTConfigManager:
         "pegasus": "bert",
         "roberta": "bert",
         "t5": "bert",
+        "whisper": "bart",
         "xlm-roberta": "bert",
     }
 
@@ -248,7 +250,7 @@ def check_io_binding(providers: List[str], use_io_binding: Optional[bool] = None
     """
     Whether to use IOBinding or not.
     """
-    if providers[0] == "CUDAExecutionProvider" and use_io_binding is None:
+    if use_io_binding is None and providers[0] == "CUDAExecutionProvider":
         use_io_binding = True
     elif providers[0] != "CUDAExecutionProvider":
         if use_io_binding is True:

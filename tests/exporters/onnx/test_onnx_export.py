@@ -168,7 +168,12 @@ def _get_models_to_test(export_models_dict: Dict):
 
                     if any(
                         task == ort_special_task
-                        for ort_special_task in ["causal-lm", "seq2seq-lm", "speech2seq-lm", "vision2seq-lm"]
+                        for ort_special_task in [
+                            "text-generation",
+                            "text2text-generation",
+                            "automatic-speech-recognition",
+                            "image-to-text",
+                        ]
                     ):
                         models_to_test.append(
                             (
@@ -204,8 +209,8 @@ class OnnxExportTestCase(TestCase):
         monolith: bool,
         device="cpu",
     ):
-        model_class = TasksManager.get_model_class_for_task(task)
         config = AutoConfig.from_pretrained(model_name)
+        model_class = TasksManager.get_model_class_for_task(task, model_type=config.model_type.replace("_", "-"))
         model = model_class.from_config(config)
 
         # Dynamic axes aren't supported for YOLO-like models. This means they cannot be exported to ONNX on CUDA devices.
@@ -219,12 +224,20 @@ class OnnxExportTestCase(TestCase):
         if (
             isinstance(onnx_config, OnnxConfigWithPast)
             and getattr(model.config, "pad_token_id", None) is None
-            and task == "sequence-classification"
+            and task == "text-classification"
         ):
             model.config.pad_token_id = 0
 
         if is_torch_available():
             from optimum.utils import torch_version
+
+            if not onnx_config.is_transformers_support_available:
+                import transformers
+
+                pytest.skip(
+                    "Skipping due to incompatible Transformers version. Minimum required is"
+                    f" {onnx_config.MIN_TRANSFORMERS_VERSION}, got: {transformers.__version__}"
+                )
 
             if not onnx_config.is_torch_support_available:
                 pytest.skip(
@@ -238,11 +251,18 @@ class OnnxExportTestCase(TestCase):
 
         if (
             model.config.is_encoder_decoder
-            and task.startswith(("seq2seq-lm", "speech2seq-lm", "vision2seq-lm", "default-with-past"))
+            and task.startswith(
+                (
+                    "text2text-generation",
+                    "automatic-speech-recognition",
+                    "image-to-text",
+                    "feature-extraction-with-past",
+                )
+            )
             and monolith is False
         ):
             models_and_onnx_configs = get_encoder_decoder_models_for_export(model, onnx_config)
-        elif task.startswith("causal-lm") and monolith is False:
+        elif task.startswith("text-generation") and monolith is False:
             models_and_onnx_configs = get_decoder_models_for_export(model, onnx_config)
         else:
             models_and_onnx_configs = {"model": (model, onnx_config)}
@@ -288,7 +308,7 @@ class OnnxExportTestCase(TestCase):
 
                 gc.collect()
 
-    def test_all_models_are_tested(self):
+    def test_all_models_tested(self):
         # make sure we test all models
         missing_models_set = TasksManager._SUPPORTED_CLI_MODEL_TYPE - set(PYTORCH_EXPORT_MODELS_TINY.keys())
         if len(missing_models_set) > 0:

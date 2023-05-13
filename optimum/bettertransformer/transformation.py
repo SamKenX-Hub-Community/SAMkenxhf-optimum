@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
+import os
+import types
 from copy import deepcopy
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Dict, Optional, Union
 
 import torch
 from packaging.version import parse
@@ -77,6 +79,17 @@ def replace_to_bettertransformer(model, config):
 
         # replace the module if it is a transformer layer compatible with bettertransformer
         target_classes = list(BetterTransformerManager.MODEL_MAPPING[config.model_type].keys())
+
+        # We may want to override methods without having to override whole modules.
+        # For example, some methods handle the mask generation, which we do not need when using PyTorch SDPA.
+        if config.model_type in BetterTransformerManager.OVERWRITE_METHODS:
+            for class_name, method_name_and_replacement in BetterTransformerManager.OVERWRITE_METHODS[
+                config.model_type
+            ].items():
+                if module.__class__.__name__ == class_name:
+                    method_name = method_name_and_replacement[0]
+                    new_method = method_name_and_replacement[1]
+                    setattr(module, method_name, types.MethodType(new_method, module))
 
         should_replace_module = False
         for target_class in target_classes:
@@ -171,7 +184,11 @@ class BetterTransformer(object):
         "Please upgrade PyTorch following https://pytorch.org/get-started/locally/ in order to use BetterTransformer.",
     )
     def transform(
-        model: torch.nn.Module, keep_original_model: bool = False, max_memory: Optional[Dict] = None, **kwargs
+        model: torch.nn.Module,
+        keep_original_model: bool = False,
+        max_memory: Optional[Dict] = None,
+        offload_dir: Optional[Union[str, os.PathLike]] = None,
+        **kwargs,
     ) -> torch.nn.Module:
         r"""
         Conversion script from `transformers` model to its BetterTransformers version
@@ -192,6 +209,7 @@ class BetterTransformer(object):
         # Check if we have to load the model using `accelerate`
         if hasattr(model, "hf_device_map"):
             load_accelerate = True
+            hf_device_map = model.hf_device_map
         else:
             load_accelerate = False
 
@@ -224,8 +242,7 @@ class BetterTransformer(object):
         hf_config = model.config
 
         if load_accelerate:
-            # remove the hooks from the original model to
-            # avoid weights being on `meta` device.
+            # Remove the hooks from the original model to avoid weights being on `meta` device.
             remove_hook_from_module(model, recurse=True)
 
         if keep_original_model:
@@ -249,24 +266,38 @@ class BetterTransformer(object):
         if BetterTransformerManager.requires_nested_tensor(model_fast.config.model_type):
             set_last_layer(model_fast)
 
-        # Step 6: Add a class arguments, we might need to identify whether the model
+        # Add a class arguments, we might need to identify whether the model
         # has been correctly converted to its `BetterTransformer` version.
         setattr(model_fast, "use_bettertransformer", True)
 
-        # Step 7: dispatch model if `accelerate` is enabled
         if load_accelerate:
-            device_map_bt = infer_auto_device_map(model_fast, max_memory=max_memory)
+            all_model_tensors = [name for name, _ in model_fast.state_dict().items()]
+            for module_name in hf_device_map.keys():
+                all_model_tensors = [name for name in all_model_tensors if not name.startswith(module_name)]
 
-            remove_hook_from_module(model_fast, recurse=True)
+            if len(all_model_tensors) > 0:
+                # This is the case where a transformed submodule is broken into several devices:
+                # as the submodules map may differ, we need to reinfer the device map
+                bt_device_map = infer_auto_device_map(model_fast, max_memory=max_memory)
+            else:
+                bt_device_map = hf_device_map
 
-            model_fast = dispatch_model(model_fast, device_map_bt)
+            model_fast = dispatch_model(model_fast, bt_device_map, offload_dir=offload_dir)
 
+            # It is not recommended to have `keep_original_model=True` with a model
+            # that is loaded with accelerate but just in case
             if keep_original_model:
-                # It is not recommended to have `keep_original_model=True` with a model
-                # that is loaded with accelerate but just in case ..
-                model = dispatch_model(model, model.hf_device_map)
+                model = dispatch_model(model, hf_device_map, offload_dir=offload_dir)
 
-        # Step 8: overwrite the `save_pretrained` method
+        # See: https://github.com/pytorch/pytorch/issues/96099
+        if BetterTransformerManager.requires_torch_20(model_fast.config.model_type):
+            logging.warning(
+                f"For training, the BetterTransformer implementation for {model_fast.config.model_type} "
+                " architecture currently does not support padding as fused kernels do not support custom"
+                " attention masks. Beware that passing padded batched training data may result in unexpected outputs."
+            )
+
+        # Overwrite the `save_pretrained` method
         # by raising an error if the user tries to save the model
         # or push it to the hub.
         model_fast._old_save_pretrained = model_fast.save_pretrained
